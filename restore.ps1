@@ -829,12 +829,6 @@ function Restore-Containers {
                     }
                 }
                 
-                # Add N8N_SECURE_COOKIE=false for n8n containers to fix localhost access
-                if ($container.image -match 'n8n' -or $container.name -match 'n8n') {
-                    $runArgs += @('-e', 'N8N_SECURE_COOKIE=false')
-                    Write-Log "Added N8N_SECURE_COOKIE=false for n8n container" -Level debug
-                }
-                
                 # Add labels
                 if ($container.labels) {
                     $container.labels.PSObject.Properties | ForEach-Object {
