@@ -614,14 +614,43 @@ function Restore-Volumes {
                 $tempDir = Join-Path $env:TEMP "docker-restore-$(Get-Random)"
                 New-Item -Path $tempDir -ItemType Directory -Force | Out-Null
                 
-                # Extract archive to temp directory based on file type
+                # Extract archive using Docker cp approach (avoids Windows path mapping issues)
                 if ($volumeFile.Extension -eq '.gz') {
-                    # Handle .tar.gz files
-                    $tarArgs = @('run', '--rm', '-v', "${tempDir}:/extract", '-v', "$($volumeFile.FullName):/archive.tar.gz", 'busybox', 'tar', '-xzf', '/archive.tar.gz', '-C', '/extract')
-                    $process = Start-Process -FilePath 'docker' -ArgumentList $tarArgs -Wait -PassThru -NoNewWindow
+                    # Handle .tar.gz files using container copy approach
+                    $extractContainer = "extract-helper-$(Get-Random)"
+                    
+                    # Create container with the archive
+                    $createArgs = @('create', '--name', $extractContainer, 'busybox', 'sh')
+                    $process = Start-Process -FilePath 'docker' -ArgumentList $createArgs -Wait -PassThru -NoNewWindow
                     if ($process.ExitCode -ne 0) {
+                        throw "Failed to create extraction container"
+                    }
+                    
+                    # Copy archive into container
+                    $copyInArgs = @('cp', $volumeFile.FullName, "${extractContainer}:/archive.tar.gz")
+                    $process = Start-Process -FilePath 'docker' -ArgumentList $copyInArgs -Wait -PassThru -NoNewWindow
+                    if ($process.ExitCode -ne 0) {
+                        docker rm $extractContainer 2>&1 | Out-Null
+                        throw "Failed to copy archive to container"
+                    }
+                    
+                    # Extract archive inside container
+                    $extractArgs = @('run', '--rm', '--volumes-from', $extractContainer, 'busybox', 'tar', '-xzf', '/archive.tar.gz', '-C', '/')
+                    $process = Start-Process -FilePath 'docker' -ArgumentList $extractArgs -Wait -PassThru -NoNewWindow
+                    if ($process.ExitCode -ne 0) {
+                        docker rm $extractContainer 2>&1 | Out-Null
                         throw "Failed to extract tar.gz archive"
                     }
+                    
+                    # Copy extracted files to temp directory
+                    $copyOutArgs = @('cp', "${extractContainer}:/.", $tempDir)
+                    $process = Start-Process -FilePath 'docker' -ArgumentList $copyOutArgs -Wait -PassThru -NoNewWindow
+                    if ($process.ExitCode -ne 0) {
+                        Write-Log "Warning: Some files may not have been extracted" -Level warn
+                    }
+                    
+                    # Clean up extraction container
+                    docker rm $extractContainer 2>&1 | Out-Null
                 } else {
                     # Handle .zip files
                     Expand-Archive -Path $volumeFile.FullName -DestinationPath $tempDir -Force
@@ -800,6 +829,12 @@ function Restore-Containers {
                     }
                 }
                 
+                # Add N8N_SECURE_COOKIE=false for n8n containers to fix localhost access
+                if ($container.image -match 'n8n' -or $container.name -match 'n8n') {
+                    $runArgs += @('-e', 'N8N_SECURE_COOKIE=false')
+                    Write-Log "Added N8N_SECURE_COOKIE=false for n8n container" -Level debug
+                }
+                
                 # Add labels
                 if ($container.labels) {
                     $container.labels.PSObject.Properties | ForEach-Object {
@@ -821,6 +856,12 @@ function Restore-Containers {
                 if ($container.ports) {
                     foreach ($port in $container.ports) {
                         try {
+                            # Validate port values before processing
+                            if (-not $port.host_port -or -not $port.container_port) {
+                                Write-Log "Skipping invalid port mapping: host_port=$($port.host_port), container_port=$($port.container_port)" -Level warn
+                                continue
+                            }
+                            
                             $hostPort = Get-AvailablePort -PreferredPort ([int]$port.host_port)
                             $portMapping = "${hostPort}:${port.container_port}"
                             if ($port.host_ip -and $port.host_ip -ne '0.0.0.0') {
@@ -845,6 +886,12 @@ function Restore-Containers {
                 if ($container.volumes) {
                     foreach ($volume in $container.volumes) {
                         if ($volume.type -eq 'volume') {
+                            # Validate volume values before processing
+                            if (-not $volume.name -or -not $volume.destination) {
+                                Write-Log "Skipping invalid volume mount: name=$($volume.name), destination=$($volume.destination)" -Level warn
+                                continue
+                            }
+                            
                             $volumeName = $volume.name + $NameSuffix
                             $volumeMount = "${volumeName}:${volume.destination}"
                             if ($volume.read_only) {
