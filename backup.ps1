@@ -1,5 +1,23 @@
 #Requires -Version 5.1
 
+[CmdletBinding()]
+param(
+    [string[]]$Include = @('images','configs','volumes','binds','networks','compose'),
+    [string[]]$Exclude = @(),
+    [ValidateSet('none','zip')]
+    [string]$Compress = 'zip',
+    [int]$SplitSize = 0,
+    [ValidateSet('off','zip-aes256')]
+    [string]$Encrypt = 'off',
+    [string]$Passphrase = '',
+    [string]$OutputRoot = '',
+    [string]$LogLevel = 'debug',  # Default to maximum detail
+    [string]$LogFile = '',
+    [switch]$DryRun,
+    [switch]$Help,
+    [switch]$TestEnvironment
+)
+
 # Handle execution policy with UAC elevation if needed
 if ((Get-ExecutionPolicy) -eq 'Restricted') {
     # Check if already running as administrator
@@ -93,24 +111,6 @@ if ((Get-ExecutionPolicy) -eq 'Restricted') {
     .\backup.ps1 --output-root D:\backups
     Backup to custom location with interactive container selection
 #>
-
-[CmdletBinding()]
-param(
-    [string[]]$Include = @('images','configs','volumes','binds','networks','compose'),
-    [string[]]$Exclude = @(),
-    [ValidateSet('none','zip')]
-    [string]$Compress = 'zip',
-    [int]$SplitSize = 0,
-    [ValidateSet('off','zip-aes256')]
-    [string]$Encrypt = 'off',
-    [string]$Passphrase = '',
-    [string]$OutputRoot = '',
-    [string]$LogLevel = 'debug',  # Default to maximum detail
-    [string]$LogFile = '',
-    [switch]$DryRun,
-    [switch]$Help,
-    [switch]$TestEnvironment
-)
 
 # IMMEDIATE ERROR LOGGING - Start logging before anything else
 $script:EmergencyLogFile = Join-Path (Split-Path -Parent $PSCommandPath) "backup-emergency-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
@@ -680,7 +680,7 @@ function Export-ContainerSnapshot {
         $containerName = $ContainerDetails.Name -replace '^/', ''
         $imageName = "$containerName-snapshot"
         $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
-        $snapshotTag = "$imageName:$timestamp"
+        $snapshotTag = "${imageName}:${timestamp}"
         
         Write-Log "Creating filesystem snapshot for container: $containerName" -Level info
         Write-Log "This captures all data stored inside the container filesystem" -Level info
@@ -1155,7 +1155,7 @@ function Generate-DockerCompose {
         if ($container.ports) {
             $service.ports = @()
             foreach ($port in $container.ports) {
-                $service.ports += "$($port.host_port):$($port.container_port)"
+                $service.ports += "${port.host_port}:${port.container_port}"
             }
         }
         
@@ -1163,11 +1163,11 @@ function Generate-DockerCompose {
             $service.volumes = @()
             foreach ($volume in $container.volumes) {
                 if ($volume.type -eq 'volume') {
-                    $service.volumes += "$($volume.name):$($volume.destination)"
+                    $service.volumes += "${volume.name}:${volume.destination}"
                     $compose.volumes[$volume.name] = @{}
                 }
                 elseif ($volume.type -eq 'bind') {
-                    $service.volumes += "$($volume.source):$($volume.destination)"
+                    $service.volumes += "${volume.source}:${volume.destination}"
                 }
             }
         }

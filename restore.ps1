@@ -1,5 +1,28 @@
 #Requires -Version 5.1
 
+[CmdletBinding()]
+param(
+    [string]$BackupRoot = '',
+    [string[]]$SelectContainers = @(),
+    [ValidateSet('load','skip')]
+    [string]$Images = 'load',
+    [ValidateSet('recreate','skip')]
+    [string]$Networks = 'recreate',
+    [ValidateSet('keep','auto-remap','fail')]
+    [string]$PortStrategy = 'keep',
+    [string]$NameSuffix = '',
+    [string]$BindRoot = '',
+    [ValidateSet('no','always','unless-stopped','on-failure')]
+    [string]$RestartPolicy = '',
+    [switch]$Decrypt,
+    [string]$Passphrase = '',
+    [switch]$DryRun,
+    [switch]$Force,
+    [string]$LogLevel = 'debug',
+    [string]$LogFile = '',
+    [switch]$Help
+)
+
 # Handle execution policy with UAC elevation if needed
 if ((Get-ExecutionPolicy) -eq 'Restricted') {
     # Check if already running as administrator
@@ -99,30 +122,6 @@ if ((Get-ExecutionPolicy) -eq 'Restricted') {
     .\restore.ps1 --bind-root C:\RestoredData --dry-run
     Preview restore with custom bind mount location
 #>
-
-[CmdletBinding()]
-param(
-    [string]$BackupRoot = '',
-    [string[]]$SelectContainers = @(),
-    [ValidateSet('load','skip')]
-    [string]$Images = 'load',
-    [ValidateSet('recreate','skip')]
-    [string]$Networks = 'recreate',
-    [ValidateSet('keep','auto-remap','fail')]
-    [string]$PortStrategy = 'keep',
-    [string]$NameSuffix = '',
-    [string]$BindRoot = '',
-    [ValidateSet('no','always','unless-stopped','on-failure')]
-    [string]$RestartPolicy = '',
-    [switch]$Decrypt,
-    [string]$Passphrase = '',
-    [switch]$DryRun,
-    [switch]$Force,
-    [ValidateSet('info','warn','debug')]
-    [string]$LogLevel = 'info',
-    [string]$LogFile = '',
-    [switch]$Help
-)
 
 # Emergency logging setup (before any other operations)
 $script:EmergencyLogFile = Join-Path (Split-Path -Parent $PSCommandPath) "restore-emergency-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
@@ -823,14 +822,14 @@ function Restore-Containers {
                     foreach ($port in $container.ports) {
                         try {
                             $hostPort = Get-AvailablePort -PreferredPort ([int]$port.host_port)
-                            $portMapping = "${hostPort}:$($port.container_port)"
+                            $portMapping = "${hostPort}:${port.container_port}"
                             if ($port.host_ip -and $port.host_ip -ne '0.0.0.0') {
-                                $portMapping = "$($port.host_ip):$portMapping"
+                                $portMapping = "${port.host_ip}:$portMapping"
                             }
                             $runArgs += @('-p', $portMapping)
                             
                             if ($hostPort -ne [int]$port.host_port) {
-                                $script:PortMappings["$($container.name):$($port.container_port)"] = $hostPort
+                                $script:PortMappings["${container.name}:${port.container_port}"] = $hostPort
                             }
                         }
                         catch {
@@ -847,7 +846,7 @@ function Restore-Containers {
                     foreach ($volume in $container.volumes) {
                         if ($volume.type -eq 'volume') {
                             $volumeName = $volume.name + $NameSuffix
-                            $volumeMount = "${volumeName}:$($volume.destination)"
+                            $volumeMount = "${volumeName}:${volume.destination}"
                             if ($volume.read_only) {
                                 $volumeMount += ':ro'
                             }
@@ -860,7 +859,7 @@ function Restore-Containers {
                                 $sourcePath = Join-Path $BindRoot $relativePath
                             }
                             
-                            $bindMount = "${sourcePath}:$($volume.destination)"
+                            $bindMount = "${sourcePath}:${volume.destination}"
                             if ($volume.read_only) {
                                 $bindMount += ':ro'
                             }
