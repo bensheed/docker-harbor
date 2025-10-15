@@ -1134,11 +1134,11 @@ function Main {
     
     if (-not (Verify-BackupIntegrity $BackupRoot)) {
         if (-not $Force) {
-            Write-Log "Backup integrity check failed. Use `--force to proceed anyway." -Level error
+            Write-Log "Backup integrity check failed. Use --force to proceed anyway." -Level error
             exit 1
         }
         else {
-            Write-Log "Proceeding despite integrity check failures (`--force specified)" -Level warn
+            Write-Log "Proceeding despite integrity check failures (--force specified)" -Level warn
         }
     }
     
