@@ -943,9 +943,11 @@ function Export-Volume {
             $contentCheck = docker run --rm -v "${VolumeName}:/volume:ro" busybox ls -la /volume 2>&1
             Write-Log "Volume contents: $contentCheck" -Level debug
             
-            # Check if volume is empty
-            $isEmpty = docker run --rm -v "${VolumeName}:/volume:ro" busybox sh -c "if [ -z \"`$(ls -A /volume)`\" ]; then echo 'empty'; else echo 'not-empty'; fi" 2>&1
-            Write-Log "Volume empty check: $isEmpty" -Level debug
+            # Check if volume is empty (simplified approach)
+            $fileCount = docker run --rm -v "${VolumeName}:/volume:ro" busybox find /volume -mindepth 1 -maxdepth 1 | Measure-Object | Select-Object -ExpandProperty Count
+            $isEmpty = if ($fileCount -eq 0) { "empty" } else { "not-empty" }
+            Write-Log "Volume file count: $fileCount" -Level debug
+            Write-Log "Volume empty check result: $isEmpty" -Level debug
             
             # Use a temporary container to tar the volume contents
             $tempContainer = "backup-helper-$(Get-Random)"
