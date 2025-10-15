@@ -1164,18 +1164,35 @@ function Export-Networks {
     }
     
     try {
-        $networksJson = docker network ls --format json 2>$null
-        if ($LASTEXITCODE -ne 0) {
-            throw "Failed to list networks"
+        # Collect networks used by selected containers
+        $usedNetworks = @()
+        foreach ($container in $script:Manifest.containers) {
+            if ($container.networks) {
+                foreach ($network in $container.networks) {
+                    if ($network.name -notin @('bridge', 'host', 'none') -and $network.name -notin $usedNetworks) {
+                        $usedNetworks += $network.name
+                        Write-Log "Found network used by container $($container.name): $($network.name)" -Level debug
+                    }
+                }
+            }
         }
         
+        Write-Log "Networks used by selected containers: $($usedNetworks -join ', ')" -Level debug
+        
         $networks = @()
-        $networksJson -split "`n" | Where-Object { $_.Trim() } | ForEach-Object {
-            $network = ConvertFrom-Json $_
-            if ($network.Name -notin @('bridge', 'host', 'none')) {
-                $networkDetails = docker network inspect $network.Name | ConvertFrom-Json
-                $networks += $networkDetails[0]
+        if ($usedNetworks.Count -gt 0) {
+            foreach ($networkName in $usedNetworks) {
+                try {
+                    $networkDetails = docker network inspect $networkName | ConvertFrom-Json
+                    $networks += $networkDetails[0]
+                    Write-Log "Exported network details: $networkName" -Level debug
+                }
+                catch {
+                    Write-Log "Warning: Could not inspect network $networkName - it may have been removed" -Level warn
+                }
             }
+        } else {
+            Write-Log "No custom networks used by selected containers" -Level debug
         }
         
         $networksFile = "$script:BackupRoot\networks.json"
