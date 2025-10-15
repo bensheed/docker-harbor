@@ -963,8 +963,10 @@ function Export-Volume {
             Write-Log "Directory access test output: $testOutput" -Level debug
             
             # Create tar archive of volume
-            if ($testExitCode -ne 0) {
-                Write-Log "Direct path mounting failed, using container copy approach" -Level debug
+            # Force use of container copy approach due to Docker Desktop Windows path mapping issues
+            Write-Log "Using container copy approach to avoid Windows path mapping issues" -Level debug
+            if ($true) {
+                Write-Log "Creating tar in temporary container, then copying to host" -Level debug
                 
                 # Create tar inside a temporary container and copy it out
                 if ($isEmpty -eq "empty") {
@@ -1006,37 +1008,14 @@ function Export-Volume {
                     docker rm $tempContainer 2>&1 | Out-Null
                     throw "Failed to create archive in container: $output"
                 }
-            } else {
-                Write-Log "Direct path mounting works, using standard approach" -Level debug
-                
-                if ($isEmpty -eq "empty") {
-                    Write-Log "Volume is empty, creating empty archive" -Level debug
-                    $tarArgs = @(
-                        'run', '--rm', '--name', $tempContainer,
-                        '-v', "${volumesPath}:/backup",
-                        'busybox', 'tar', 'czf', "/backup/$VolumeName.tar.gz", '--files-from', '/dev/null'
-                    )
-                } else {
-                    Write-Log "Volume has content, creating standard archive" -Level debug
-                    $tarArgs = @(
-                        'run', '--rm', '--name', $tempContainer,
-                        '-v', "${VolumeName}:/volume:ro",
-                        '-v', "${volumesPath}:/backup",
-                        'busybox', 'tar', 'czf', "/backup/$VolumeName.tar.gz", '-C', '/volume', '.'
-                    )
-                }
-                
-                Write-Log "Running Docker command: docker $($tarArgs -join ' ')" -Level debug
-                $dockerCmd = "docker $($tarArgs -join ' ')"
-                $output = cmd /c "$dockerCmd 2>&1"
-                $exitCode = $LASTEXITCODE
             }
             
             Write-Log "Volume name for file path: '$VolumeName'" -Level debug
             Write-Log "Backup directory: ${script:BackupRoot}\volumes" -Level debug
             
-            Write-Log "Docker command output: $output" -Level debug
-            Write-Log "Docker command exit code: $exitCode" -Level debug
+            # Set success exit code for container copy approach
+            $exitCode = 0
+            Write-Log "Container copy approach completed successfully" -Level debug
             if ($exitCode -ne 0) {
                 throw "Volume backup failed with exit code $exitCode. Output: $output"
             }
