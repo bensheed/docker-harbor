@@ -994,60 +994,35 @@ function Start-RestoredContainers {
         return
     }
     
-    Write-Host "`n" -NoNewline
+    Write-Host ""
     Write-Host "=== CONTAINER STARTUP ===" -ForegroundColor Cyan
-    Write-Host "Restored $($script:RestoredContainers.Count) container(s):"
+    Write-Host "Restored containers:"
     foreach ($container in $script:RestoredContainers) {
         Write-Host "  - $container" -ForegroundColor Gray
     }
     
     if ($NonInteractive) {
-        Write-Host "Running in non-interactive mode - containers left stopped" -ForegroundColor Yellow
-        Write-Host "Use 'docker start `<container-name`>' to start them manually" -ForegroundColor Gray
+        Write-Host "Non-interactive mode - containers left stopped" -ForegroundColor Yellow
         return
     }
     
     Write-Host ""
-    do {
-        $response = Read-Host "Start all restored containers now? (y/n)"
-        $response = $response.Trim().ToLower()
-    } while ($response -notin @('y', 'yes', 'n', 'no'))
+    $response = Read-Host "Start all restored containers now? (y/n)"
     
-    if ($response -in @('y', 'yes')) {
+    if ($response -eq 'y' -or $response -eq 'yes') {
         Write-Host "Starting containers..." -ForegroundColor Green
-        $startedCount = 0
-        $failedCount = 0
-        
         foreach ($containerName in $script:RestoredContainers) {
+            Write-Host "Starting $containerName..." -NoNewline
             try {
-                Write-Host "  Starting $containerName..." -NoNewline
-                $process = Start-Process -FilePath 'docker' -ArgumentList @('start', $containerName) -Wait -PassThru -NoNewWindow -RedirectStandardOutput $null -RedirectStandardError $null
-                if ($process.ExitCode -eq 0) {
-                    Write-Host " ✓" -ForegroundColor Green
-                    $startedCount++
-                } else {
-                    Write-Host " ✗" -ForegroundColor Red
-                    $failedCount++
-                    Write-Log "Failed to start container $containerName" -Level warn
-                }
+                docker start $containerName | Out-Null
+                Write-Host " OK" -ForegroundColor Green
             }
             catch {
-                Write-Host " ✗" -ForegroundColor Red
-                $failedCount++
-                Write-Log "Error starting container ${containerName}: $_" -Level warn
+                Write-Host " FAILED" -ForegroundColor Red
             }
         }
-        
-        Write-Host ""
-        if ($startedCount -gt 0) {
-            Write-Host "Successfully started $startedCount container(s)" -ForegroundColor Green
-        }
-        if ($failedCount -gt 0) {
-            Write-Host "Failed to start $failedCount container(s)" -ForegroundColor Yellow
-            Write-Host "Check Docker logs for details: docker logs `<container-name`>" -ForegroundColor Gray
-        }
     } else {
-        Write-Host "Containers left stopped - use 'docker start `<container-name`>' to start them manually" -ForegroundColor Gray
+        Write-Host "Containers left stopped" -ForegroundColor Gray
     }
 }
 
