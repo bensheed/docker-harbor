@@ -20,6 +20,7 @@ param(
     [switch]$Force,
     [string]$LogLevel = 'debug',
     [string]$LogFile = '',
+    [switch]$NonInteractive,
     [switch]$Help
 )
 
@@ -103,6 +104,9 @@ if ((Get-ExecutionPolicy) -eq 'Restricted') {
 .PARAMETER LogFile
     Custom log file path
 
+.PARAMETER NonInteractive
+    Run without user prompts (for automation/CI/CD)
+
 .PARAMETER Help
     Show detailed help and examples
 
@@ -121,6 +125,10 @@ if ((Get-ExecutionPolicy) -eq 'Restricted') {
 .EXAMPLE
     .\restore.ps1 --bind-root C:\RestoredData --dry-run
     Preview restore with custom bind mount location
+
+.EXAMPLE
+    .\restore.ps1 --non-interactive
+    Restore without prompts (for automation)
 #>
 
 # Emergency logging setup (before any other operations)
@@ -147,6 +155,7 @@ function Show-Help {
     Write-Host "  .\restore.ps1 --select-containers web,db                # Restore specific containers"
     Write-Host "  .\restore.ps1 --name-suffix -test --port-strategy auto-remap  # Test restore with remapping"
     Write-Host "  .\restore.ps1 --bind-root C:\NewLocation --dry-run      # Preview with custom bind location"
+    Write-Host "  .\restore.ps1 --non-interactive                         # Restore without prompts (automation)"
     exit 0
 }
 
@@ -980,6 +989,68 @@ function Restore-Containers {
     return $success
 }
 
+function Start-RestoredContainers {
+    if ($script:RestoredContainers.Count -eq 0) {
+        return
+    }
+    
+    Write-Host "`n" -NoNewline
+    Write-Host "=== CONTAINER STARTUP ===" -ForegroundColor Cyan
+    Write-Host "Restored $($script:RestoredContainers.Count) container(s):"
+    foreach ($container in $script:RestoredContainers) {
+        Write-Host "  - $container" -ForegroundColor Gray
+    }
+    
+    if ($NonInteractive) {
+        Write-Host "Running in non-interactive mode - containers left stopped" -ForegroundColor Yellow
+        Write-Host "Use 'docker start <container-name>' to start them manually" -ForegroundColor Gray
+        return
+    }
+    
+    Write-Host ""
+    do {
+        $response = Read-Host "Start all restored containers now? (y/n)"
+        $response = $response.Trim().ToLower()
+    } while ($response -notin @('y', 'yes', 'n', 'no'))
+    
+    if ($response -in @('y', 'yes')) {
+        Write-Host "Starting containers..." -ForegroundColor Green
+        $startedCount = 0
+        $failedCount = 0
+        
+        foreach ($containerName in $script:RestoredContainers) {
+            try {
+                Write-Host "  Starting $containerName..." -NoNewline
+                $process = Start-Process -FilePath 'docker' -ArgumentList @('start', $containerName) -Wait -PassThru -NoNewWindow -RedirectStandardOutput $null -RedirectStandardError $null
+                if ($process.ExitCode -eq 0) {
+                    Write-Host " ✓" -ForegroundColor Green
+                    $startedCount++
+                } else {
+                    Write-Host " ✗" -ForegroundColor Red
+                    $failedCount++
+                    Write-Log "Failed to start container $containerName" -Level warn
+                }
+            }
+            catch {
+                Write-Host " ✗" -ForegroundColor Red
+                $failedCount++
+                Write-Log "Error starting container $containerName`: $_" -Level warn
+            }
+        }
+        
+        Write-Host ""
+        if ($startedCount -gt 0) {
+            Write-Host "Successfully started $startedCount container(s)" -ForegroundColor Green
+        }
+        if ($failedCount -gt 0) {
+            Write-Host "Failed to start $failedCount container(s)" -ForegroundColor Yellow
+            Write-Host "Check Docker logs for details: docker logs <container-name>" -ForegroundColor Gray
+        }
+    } else {
+        Write-Host "Containers left stopped - use 'docker start <container-name>' to start them manually" -ForegroundColor Gray
+    }
+}
+
 function Show-Summary {
     $duration = (Get-Date) - $script:StartTime
     
@@ -1120,15 +1191,28 @@ function Main {
         $success = $false
     }
     
+    # Ask user if they want to start the restored containers
+    if ($script:RestoredContainers.Count -gt 0 -and -not $DryRun) {
+        Start-RestoredContainers
+    }
+    
     # Show summary
     Show-Summary
     
     if ($success) {
         Write-Log "Restore completed successfully" -Level info
+        if (-not $NonInteractive) {
+            Write-Host ""
+            Read-Host "Press Enter to exit"
+        }
         exit 0
     }
     else {
         Write-Log "Restore completed with errors" -Level error
+        if (-not $NonInteractive) {
+            Write-Host ""
+            Read-Host "Press Enter to exit"
+        }
         exit 1
     }
 }
@@ -1144,6 +1228,8 @@ catch {
     try { "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Stack trace: $($_.ScriptStackTrace)" | Add-Content -Path $script:EmergencyLogFile } catch { }
     Write-Host "CRITICAL ERROR: $($_.Exception.Message)" -ForegroundColor Red
     Write-Host "Emergency log saved to: $script:EmergencyLogFile" -ForegroundColor Yellow
-    Read-Host "Press Enter to exit"
+    if (-not $NonInteractive) {
+        Read-Host "Press Enter to exit"
+    }
     exit 1
 }
