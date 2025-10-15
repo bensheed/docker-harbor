@@ -967,7 +967,7 @@ function Export-Volume {
                 Write-Log "Direct path mounting failed, using container copy approach" -Level debug
                 
                 # Create tar inside a temporary container and copy it out
-                if ($isEmpty -match "empty") {
+                if ($isEmpty -eq "empty") {
                     Write-Log "Volume is empty, creating empty archive in container" -Level debug
                     $tarArgs = @(
                         'run', '--name', $tempContainer,
@@ -1009,7 +1009,7 @@ function Export-Volume {
             } else {
                 Write-Log "Direct path mounting works, using standard approach" -Level debug
                 
-                if ($isEmpty -match "empty") {
+                if ($isEmpty -eq "empty") {
                     Write-Log "Volume is empty, creating empty archive" -Level debug
                     $tarArgs = @(
                         'run', '--rm', '--name', $tempContainer,
