@@ -1003,7 +1003,7 @@ function Start-RestoredContainers {
     
     if ($NonInteractive) {
         Write-Host "Running in non-interactive mode - containers left stopped" -ForegroundColor Yellow
-        Write-Host "Use 'docker start <container-name>' to start them manually" -ForegroundColor Gray
+        Write-Host "Use 'docker start `<container-name`>' to start them manually" -ForegroundColor Gray
         return
     }
     
@@ -1044,10 +1044,10 @@ function Start-RestoredContainers {
         }
         if ($failedCount -gt 0) {
             Write-Host "Failed to start $failedCount container(s)" -ForegroundColor Yellow
-            Write-Host "Check Docker logs for details: docker logs <container-name>" -ForegroundColor Gray
+            Write-Host "Check Docker logs for details: docker logs `<container-name`>" -ForegroundColor Gray
         }
     } else {
-        Write-Host "Containers left stopped - use 'docker start <container-name>' to start them manually" -ForegroundColor Gray
+        Write-Host "Containers left stopped - use 'docker start `<container-name`>' to start them manually" -ForegroundColor Gray
     }
 }
 
@@ -1134,11 +1134,11 @@ function Main {
     
     if (-not (Verify-BackupIntegrity $BackupRoot)) {
         if (-not $Force) {
-            Write-Log "Backup integrity check failed. Use --force to proceed anyway." -Level error
+            Write-Log "Backup integrity check failed. Use `--force to proceed anyway." -Level error
             exit 1
         }
         else {
-            Write-Log "Proceeding despite integrity check failures (--force specified)" -Level warn
+            Write-Log "Proceeding despite integrity check failures (`--force specified)" -Level warn
         }
     }
     
