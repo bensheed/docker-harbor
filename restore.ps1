@@ -850,10 +850,12 @@ function Restore-Containers {
                 if ($container.ports) {
                     foreach ($port in $container.ports) {
                         try {
-                            # Validate port values before processing
+                            # Debug: Log port configuration for troubleshooting
+                            Write-Log "Processing port: host_port=$($port.host_port), container_port=$($port.container_port), host_ip=$($port.host_ip)" -Level debug
+                            
+                            # Validate port values and fail if invalid (don't skip)
                             if (-not $port.host_port -or -not $port.container_port) {
-                                Write-Log "Skipping invalid port mapping: host_port=$($port.host_port), container_port=$($port.container_port)" -Level warn
-                                continue
+                                throw "Invalid port mapping in backup data: host_port=$($port.host_port), container_port=$($port.container_port). Backup may be corrupted."
                             }
                             
                             $hostPort = Get-AvailablePort -PreferredPort ([int]$port.host_port)
@@ -880,10 +882,12 @@ function Restore-Containers {
                 if ($container.volumes) {
                     foreach ($volume in $container.volumes) {
                         if ($volume.type -eq 'volume') {
-                            # Validate volume values before processing
+                            # Debug: Log volume configuration for troubleshooting
+                            Write-Log "Processing volume: name=$($volume.name), destination=$($volume.destination), type=$($volume.type)" -Level debug
+                            
+                            # Validate volume values and fail if invalid (don't skip)
                             if (-not $volume.name -or -not $volume.destination) {
-                                Write-Log "Skipping invalid volume mount: name=$($volume.name), destination=$($volume.destination)" -Level warn
-                                continue
+                                throw "Invalid volume mount in backup data: name=$($volume.name), destination=$($volume.destination). Backup may be corrupted."
                             }
                             
                             $volumeName = $volume.name + $NameSuffix
