@@ -944,38 +944,94 @@ function Export-Volume {
             Write-Log "Volume contents: $contentCheck" -Level debug
             
             # Check if volume is empty
-            $isEmpty = docker run --rm -v "${VolumeName}:/volume:ro" busybox sh -c "[ -z `"`$(ls -A /volume)`" ] && echo 'empty' || echo 'not-empty'" 2>&1
+            $isEmpty = docker run --rm -v "${VolumeName}:/volume:ro" busybox sh -c "if [ -z \"`$(ls -A /volume)`\" ]; then echo 'empty'; else echo 'not-empty'; fi" 2>&1
             Write-Log "Volume empty check: $isEmpty" -Level debug
             
             # Use a temporary container to tar the volume contents
             $tempContainer = "backup-helper-$(Get-Random)"
             
+            # Test if Docker can access the backup directory
+            $volumesPath = "${script:BackupRoot}\volumes"
+            Write-Log "Testing Docker access to backup directory: $volumesPath" -Level debug
+            
+            $testCmd = "docker run --rm -v `"${volumesPath}:/test`" busybox ls -la /test"
+            $testOutput = cmd /c "$testCmd 2>&1"
+            $testExitCode = $LASTEXITCODE
+            Write-Log "Directory access test exit code: $testExitCode" -Level debug
+            Write-Log "Directory access test output: $testOutput" -Level debug
+            
             # Create tar archive of volume
-            if ($isEmpty -match "empty") {
-                Write-Log "Volume is empty, creating empty archive" -Level debug
-                $tarArgs = @(
-                    'run', '--rm', '--name', $tempContainer,
-                    '-v', "${script:BackupRoot}\volumes:/backup",
-                    'busybox', 'tar', 'czf', "/backup/$VolumeName.tar.gz", '--files-from', '/dev/null'
-                )
+            if ($testExitCode -ne 0) {
+                Write-Log "Direct path mounting failed, using container copy approach" -Level debug
+                
+                # Create tar inside a temporary container and copy it out
+                if ($isEmpty -match "empty") {
+                    Write-Log "Volume is empty, creating empty archive in container" -Level debug
+                    $tarArgs = @(
+                        'run', '--name', $tempContainer,
+                        'busybox', 'tar', 'czf', "/tmp/$VolumeName.tar.gz", '--files-from', '/dev/null'
+                    )
+                } else {
+                    Write-Log "Volume has content, creating archive in container" -Level debug
+                    $tarArgs = @(
+                        'run', '--name', $tempContainer,
+                        '-v', "${VolumeName}:/volume:ro",
+                        'busybox', 'tar', 'czf', "/tmp/$VolumeName.tar.gz", '-C', '/volume', '.'
+                    )
+                }
+                
+                Write-Log "Creating archive in temporary container..." -Level debug
+                $dockerCmd = "docker $($tarArgs -join ' ')"
+                $output = cmd /c "$dockerCmd 2>&1"
+                $exitCode = $LASTEXITCODE
+                
+                if ($exitCode -eq 0) {
+                    Write-Log "Copying archive from container to host..." -Level debug
+                    $copyCmd = "docker cp ${tempContainer}:/tmp/$VolumeName.tar.gz `"$volumesPath\$VolumeName.tar.gz`""
+                    $copyOutput = cmd /c "$copyCmd 2>&1"
+                    $copyExitCode = $LASTEXITCODE
+                    Write-Log "Copy command: $copyCmd" -Level debug
+                    Write-Log "Copy output: $copyOutput" -Level debug
+                    Write-Log "Copy exit code: $copyExitCode" -Level debug
+                    
+                    # Clean up temporary container
+                    docker rm $tempContainer 2>&1 | Out-Null
+                    
+                    if ($copyExitCode -ne 0) {
+                        throw "Failed to copy archive from container: $copyOutput"
+                    }
+                } else {
+                    docker rm $tempContainer 2>&1 | Out-Null
+                    throw "Failed to create archive in container: $output"
+                }
             } else {
-                Write-Log "Volume has content, creating standard archive" -Level debug
-                $tarArgs = @(
-                    'run', '--rm', '--name', $tempContainer,
-                    '-v', "${VolumeName}:/volume:ro",
-                    '-v', "${script:BackupRoot}\volumes:/backup",
-                    'busybox', 'tar', 'czf', "/backup/$VolumeName.tar.gz", '-C', '/volume', '.'
-                )
+                Write-Log "Direct path mounting works, using standard approach" -Level debug
+                
+                if ($isEmpty -match "empty") {
+                    Write-Log "Volume is empty, creating empty archive" -Level debug
+                    $tarArgs = @(
+                        'run', '--rm', '--name', $tempContainer,
+                        '-v', "${volumesPath}:/backup",
+                        'busybox', 'tar', 'czf', "/backup/$VolumeName.tar.gz", '--files-from', '/dev/null'
+                    )
+                } else {
+                    Write-Log "Volume has content, creating standard archive" -Level debug
+                    $tarArgs = @(
+                        'run', '--rm', '--name', $tempContainer,
+                        '-v', "${VolumeName}:/volume:ro",
+                        '-v', "${volumesPath}:/backup",
+                        'busybox', 'tar', 'czf', "/backup/$VolumeName.tar.gz", '-C', '/volume', '.'
+                    )
+                }
+                
+                Write-Log "Running Docker command: docker $($tarArgs -join ' ')" -Level debug
+                $dockerCmd = "docker $($tarArgs -join ' ')"
+                $output = cmd /c "$dockerCmd 2>&1"
+                $exitCode = $LASTEXITCODE
             }
             
-            Write-Log "Running Docker command: docker $($tarArgs -join ' ')" -Level debug
             Write-Log "Volume name for file path: '$VolumeName'" -Level debug
             Write-Log "Backup directory: ${script:BackupRoot}\volumes" -Level debug
-            
-            # Use direct docker command instead of Start-Process to avoid hanging
-            $dockerCmd = "docker $($tarArgs -join ' ')"
-            $output = cmd /c "$dockerCmd 2>&1"
-            $exitCode = $LASTEXITCODE
             
             Write-Log "Docker command output: $output" -Level debug
             Write-Log "Docker command exit code: $exitCode" -Level debug
