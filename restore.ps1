@@ -1219,15 +1219,10 @@ function Main {
 
 # Execute main function with emergency error handling
 try {
-    try { "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] About to call Main function" | Add-Content -Path $script:EmergencyLogFile } catch { }
     Main
-    try { "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Main function completed successfully" | Add-Content -Path $script:EmergencyLogFile } catch { }
 }
 catch {
-    try { "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] CRITICAL ERROR in Main: $($_.Exception.Message)" | Add-Content -Path $script:EmergencyLogFile } catch { }
-    try { "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Stack trace: $($_.ScriptStackTrace)" | Add-Content -Path $script:EmergencyLogFile } catch { }
     Write-Host "CRITICAL ERROR: $($_.Exception.Message)" -ForegroundColor Red
-    Write-Host "Emergency log saved to: $script:EmergencyLogFile" -ForegroundColor Yellow
     if (-not $NonInteractive) {
         Read-Host "Press Enter to exit"
     }
