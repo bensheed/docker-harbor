@@ -931,19 +931,33 @@ function Export-Volume {
     
     if (-not $DryRun) {
         try {
+            # First, check if the volume actually exists and has content
+            Write-Log "Checking if volume exists: $VolumeName" -Level debug
+            $volumeInspect = docker volume inspect $VolumeName 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                throw "Volume does not exist: $VolumeName. Error: $volumeInspect"
+            }
+            Write-Log "Volume exists, checking contents..." -Level debug
+            
+            # Check volume contents first
+            $contentCheck = docker run --rm -v "${VolumeName}:/volume:ro" busybox ls -la /volume 2>&1
+            Write-Log "Volume contents: $contentCheck" -Level debug
+            
             # Use a temporary container to tar the volume contents
             $tempContainer = "backup-helper-$(Get-Random)"
             
-            # Create tar archive of volume
+            # Create tar archive of volume with better error handling
             $tarArgs = @(
                 'run', '--rm', '--name', $tempContainer,
                 '-v', "${VolumeName}:/volume:ro",
                 '-v', "${script:BackupRoot}\volumes:/backup",
-                'busybox', 'tar', 'czf', "/backup/$VolumeName.tar.gz", '-C', '/volume', '.'
+                'busybox', 'sh', '-c', 
+                "cd /volume && if [ `$(ls -A | wc -l) -eq 0 ]; then echo 'Volume is empty, creating empty archive'; tar czf /backup/$VolumeName.tar.gz --files-from /dev/null; else echo 'Volume has content, creating archive'; tar czf /backup/$VolumeName.tar.gz .; fi"
             )
             
             Write-Log "Running Docker command: docker $($tarArgs -join ' ')" -Level debug
             Write-Log "Volume name for file path: '$VolumeName'" -Level debug
+            Write-Log "Backup directory: ${script:BackupRoot}\volumes" -Level debug
             
             # Use direct docker command instead of Start-Process to avoid hanging
             $dockerCmd = "docker $($tarArgs -join ' ')"
@@ -959,16 +973,30 @@ function Export-Volume {
             $tarFile = "$script:BackupRoot\volumes\$VolumeName.tar.gz"
             Write-Log "Expected tar file path: '$tarFile'" -Level debug
             
+            # Wait a moment for file system to sync
+            Start-Sleep -Seconds 2
+            
             # Verify the file was actually created and has content
             if (-not (Test-Path $tarFile)) {
                 # List what files were actually created in the volumes directory
                 $volumesDir = "$script:BackupRoot\volumes"
+                Write-Log "Checking volumes directory: $volumesDir" -Level debug
                 if (Test-Path $volumesDir) {
                     $actualFiles = Get-ChildItem -Path $volumesDir -File | Select-Object -ExpandProperty Name
                     Write-Log "Files actually created in volumes directory: $($actualFiles -join ', ')" -Level debug
+                    
+                    # Also check for any files with similar names
+                    $allFiles = Get-ChildItem -Path $volumesDir -File | ForEach-Object { "$($_.Name) (Size: $($_.Length) bytes)" }
+                    Write-Log "All files in volumes directory: $($allFiles -join ', ')" -Level debug
                 } else {
                     Write-Log "Volumes directory does not exist: $volumesDir" -Level debug
                 }
+                
+                # Check if Docker Desktop is using a different path mapping
+                Write-Log "Checking if this is a Docker Desktop path mapping issue..." -Level debug
+                $dockerInfo = docker info 2>&1 | Select-String "Operating System"
+                Write-Log "Docker info: $dockerInfo" -Level debug
+                
                 throw "Volume backup file was not created: $tarFile"
             }
             if ((Get-Item $tarFile).Length -eq 0) {
