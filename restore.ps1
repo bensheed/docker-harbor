@@ -1034,7 +1034,7 @@ function Start-RestoredContainers {
             catch {
                 Write-Host " ✗" -ForegroundColor Red
                 $failedCount++
-                Write-Log "Error starting container $containerName`: $_" -Level warn
+                Write-Log "Error starting container $containerName: $_" -Level warn
             }
         }
         
