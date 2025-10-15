@@ -1198,7 +1198,12 @@ function Export-Networks {
         $networksFile = "$script:BackupRoot\networks.json"
         
         if (-not $DryRun) {
-            $networks | ConvertTo-Json -Depth 10 | Set-Content -Path $networksFile -Encoding UTF8
+            # Ensure we always create valid JSON, even for empty arrays
+            if ($networks.Count -eq 0) {
+                "[]" | Set-Content -Path $networksFile -Encoding UTF8
+            } else {
+                $networks | ConvertTo-Json -Depth 10 | Set-Content -Path $networksFile -Encoding UTF8
+            }
             $checksum = Get-FileHash -Path $networksFile -Algorithm SHA256
             $script:Manifest.checksums["networks.json"] = $checksum.Hash
         }
