@@ -635,21 +635,56 @@ function Restore-Volumes {
                         throw "Failed to create extraction container"
                     }
                     
+                    # Verify archive file exists and get size
+                    $archiveSize = [math]::Round($volumeFile.Length / 1MB, 2)
+                    Write-Log "Archive file: $($volumeFile.FullName) (${archiveSize}MB)" -Level debug
+                    
                     # Copy archive into container
+                    Write-Log "Copying archive to extraction container..." -Level debug
                     $copyInArgs = @('cp', $volumeFile.FullName, "${extractContainer}:/archive.tar.gz")
-                    $process = Start-Process -FilePath 'docker' -ArgumentList $copyInArgs -Wait -PassThru -NoNewWindow
-                    if ($process.ExitCode -ne 0) {
+                    $copyProcess = Start-Process -FilePath 'docker' -ArgumentList $copyInArgs -Wait -PassThru -NoNewWindow -RedirectStandardError "$env:TEMP\copy_err.log"
+                    if ($copyProcess.ExitCode -ne 0) {
+                        $copyError = Get-Content "$env:TEMP\copy_err.log" -Raw -ErrorAction SilentlyContinue
+                        Write-Log "Failed to copy archive to container: $copyError" -Level error
                         docker rm $extractContainer 2>&1 | Out-Null
-                        throw "Failed to copy archive to container"
+                        throw "Failed to copy archive to container: $copyError"
                     }
                     
-                    # Extract archive inside container
-                    $extractArgs = @('run', '--rm', '--volumes-from', $extractContainer, 'busybox', 'tar', '-xzf', '/archive.tar.gz', '-C', '/')
-                    $process = Start-Process -FilePath 'docker' -ArgumentList $extractArgs -Wait -PassThru -NoNewWindow
-                    if ($process.ExitCode -ne 0) {
-                        docker rm $extractContainer 2>&1 | Out-Null
-                        throw "Failed to extract tar.gz archive"
+                    # Verify archive was copied correctly
+                    $verifyArgs = @('run', '--rm', '--volumes-from', $extractContainer, 'busybox', 'ls', '-la', '/archive.tar.gz')
+                    $verifyProcess = Start-Process -FilePath 'docker' -ArgumentList $verifyArgs -Wait -PassThru -NoNewWindow -RedirectStandardOutput "$env:TEMP\verify.log"
+                    if ($verifyProcess.ExitCode -eq 0) {
+                        $verifyOutput = Get-Content "$env:TEMP\verify.log" -Raw -ErrorAction SilentlyContinue
+                        Write-Log "Archive in container: $verifyOutput" -Level debug
                     }
+                    
+                    # Test archive integrity first
+                    Write-Log "Testing archive integrity..." -Level debug
+                    $testArgs = @('run', '--rm', '--volumes-from', $extractContainer, 'busybox', 'tar', '-tzf', '/archive.tar.gz')
+                    $testProcess = Start-Process -FilePath 'docker' -ArgumentList $testArgs -Wait -PassThru -NoNewWindow -RedirectStandardOutput "$env:TEMP\tar_test.log" -RedirectStandardError "$env:TEMP\tar_test_err.log"
+                    if ($testProcess.ExitCode -ne 0) {
+                        $testError = Get-Content "$env:TEMP\tar_test_err.log" -Raw -ErrorAction SilentlyContinue
+                        Write-Log "Archive integrity test failed: $testError" -Level error
+                        docker rm $extractContainer 2>&1 | Out-Null
+                        throw "Archive integrity test failed: $testError"
+                    }
+                    $testOutput = Get-Content "$env:TEMP\tar_test.log" -Raw -ErrorAction SilentlyContinue
+                    Write-Log "Archive contents preview: $($testOutput.Split("`n")[0..4] -join ', ')..." -Level debug
+                    
+                    # Extract archive inside container with verbose output
+                    Write-Log "Extracting archive with verbose logging..." -Level debug
+                    $extractArgs = @('run', '--rm', '--volumes-from', $extractContainer, 'busybox', 'tar', '-xzvf', '/archive.tar.gz', '-C', '/')
+                    $extractProcess = Start-Process -FilePath 'docker' -ArgumentList $extractArgs -Wait -PassThru -NoNewWindow -RedirectStandardOutput "$env:TEMP\tar_extract.log" -RedirectStandardError "$env:TEMP\tar_extract_err.log"
+                    if ($extractProcess.ExitCode -ne 0) {
+                        $extractError = Get-Content "$env:TEMP\tar_extract_err.log" -Raw -ErrorAction SilentlyContinue
+                        $extractOutput = Get-Content "$env:TEMP\tar_extract.log" -Raw -ErrorAction SilentlyContinue
+                        Write-Log "Archive extraction failed. Error: $extractError" -Level error
+                        Write-Log "Archive extraction output: $extractOutput" -Level debug
+                        docker rm $extractContainer 2>&1 | Out-Null
+                        throw "Failed to extract tar.gz archive: $extractError"
+                    }
+                    $extractOutput = Get-Content "$env:TEMP\tar_extract.log" -Raw -ErrorAction SilentlyContinue
+                    Write-Log "Archive extracted successfully. Files: $($extractOutput.Split("`n").Count) entries" -Level debug
                     
                     # Copy extracted files to temp directory
                     $copyOutArgs = @('cp', "${extractContainer}:/.", $tempDir)
