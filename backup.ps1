@@ -943,17 +943,30 @@ function Export-Volume {
             $contentCheck = docker run --rm -v "${VolumeName}:/volume:ro" busybox ls -la /volume 2>&1
             Write-Log "Volume contents: $contentCheck" -Level debug
             
+            # Check if volume is empty
+            $isEmpty = docker run --rm -v "${VolumeName}:/volume:ro" busybox sh -c "[ -z `"`$(ls -A /volume)`" ] && echo 'empty' || echo 'not-empty'" 2>&1
+            Write-Log "Volume empty check: $isEmpty" -Level debug
+            
             # Use a temporary container to tar the volume contents
             $tempContainer = "backup-helper-$(Get-Random)"
             
-            # Create tar archive of volume with better error handling
-            $tarArgs = @(
-                'run', '--rm', '--name', $tempContainer,
-                '-v', "${VolumeName}:/volume:ro",
-                '-v', "${script:BackupRoot}\volumes:/backup",
-                'busybox', 'sh', '-c', 
-                "cd /volume && if [ `$(ls -A | wc -l) -eq 0 ]; then echo 'Volume is empty, creating empty archive'; tar czf /backup/$VolumeName.tar.gz --files-from /dev/null; else echo 'Volume has content, creating archive'; tar czf /backup/$VolumeName.tar.gz .; fi"
-            )
+            # Create tar archive of volume
+            if ($isEmpty -match "empty") {
+                Write-Log "Volume is empty, creating empty archive" -Level debug
+                $tarArgs = @(
+                    'run', '--rm', '--name', $tempContainer,
+                    '-v', "${script:BackupRoot}\volumes:/backup",
+                    'busybox', 'tar', 'czf', "/backup/$VolumeName.tar.gz", '--files-from', '/dev/null'
+                )
+            } else {
+                Write-Log "Volume has content, creating standard archive" -Level debug
+                $tarArgs = @(
+                    'run', '--rm', '--name', $tempContainer,
+                    '-v', "${VolumeName}:/volume:ro",
+                    '-v', "${script:BackupRoot}\volumes:/backup",
+                    'busybox', 'tar', 'czf', "/backup/$VolumeName.tar.gz", '-C', '/volume', '.'
+                )
+            }
             
             Write-Log "Running Docker command: docker $($tarArgs -join ' ')" -Level debug
             Write-Log "Volume name for file path: '$VolumeName'" -Level debug
