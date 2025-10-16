@@ -683,14 +683,52 @@ function Restore-Volumes {
                             
                             Write-Log "Setting ownership for volume $volumeName to '$user' using image $image" -Level debug
                             
-                            # Use the actual container image for chown - it knows about the user
-                            # This avoids needing to resolve usernames to numeric IDs
+                            # Try using the actual container image for chown - it knows about the user
                             $chownArgs = @('run', '--rm', '-v', "${volumeName}:/volume", $image, 'chown', '-R', $user, '/volume')
                             $chownProcess = Start-Process -FilePath 'docker' -ArgumentList $chownArgs -Wait -PassThru -NoNewWindow -RedirectStandardError "$env:TEMP\chown_err.log"
                             
                             if ($chownProcess.ExitCode -ne 0) {
                                 $chownError = Get-Content "$env:TEMP\chown_err.log" -Raw -ErrorAction SilentlyContinue
-                                Write-Log "Warning: Failed to set ownership using image's chown: $chownError" -Level warn
+                                Write-Log "Failed to set ownership using image's chown: $chownError" -Level debug
+                                
+                                # Fallback: resolve username to numeric UID:GID and use busybox
+                                Write-Log "Attempting fallback: resolving '$user' to numeric UID:GID" -Level debug
+                                
+                                $numericUser = $null
+                                if ($user -match '^\d+:\d+$') {
+                                    # Already numeric
+                                    $numericUser = $user
+                                } else {
+                                    # Try to resolve using the container image
+                                    try {
+                                        $idOutput = docker run --rm $image sh -c "id -u $user 2>/dev/null && id -g $user 2>/dev/null" 2>&1
+                                        if ($LASTEXITCODE -eq 0 -and $idOutput) {
+                                            $lines = $idOutput -split "`n" | Where-Object { $_ -match '^\d+$' }
+                                            if ($lines.Count -ge 2) {
+                                                $numericUser = "$($lines[0].Trim()):$($lines[1].Trim())"
+                                                Write-Log "Resolved '$user' to $numericUser" -Level debug
+                                            }
+                                        }
+                                    } catch {
+                                        Write-Log "Could not resolve user '$user' to numeric ID: $_" -Level debug
+                                    }
+                                }
+                                
+                                if ($numericUser) {
+                                    # Use busybox with numeric IDs
+                                    Write-Log "Setting ownership using busybox with numeric ID: $numericUser" -Level debug
+                                    $busyboxArgs = @('run', '--rm', '-v', "${volumeName}:/volume", 'busybox', 'chown', '-R', $numericUser, '/volume')
+                                    $busyboxProcess = Start-Process -FilePath 'docker' -ArgumentList $busyboxArgs -Wait -PassThru -NoNewWindow -RedirectStandardError "$env:TEMP\chown_err2.log"
+                                    
+                                    if ($busyboxProcess.ExitCode -eq 0) {
+                                        Write-Log "Ownership set successfully using busybox" -Level debug
+                                    } else {
+                                        $busyboxError = Get-Content "$env:TEMP\chown_err2.log" -Raw -ErrorAction SilentlyContinue
+                                        Write-Log "Warning: Failed to set ownership using busybox: $busyboxError" -Level warn
+                                    }
+                                } else {
+                                    Write-Log "Warning: Could not resolve user '$user' to numeric ID, skipping ownership fix" -Level warn
+                                }
                             } else {
                                 Write-Log "Ownership set successfully" -Level debug
                             }
