@@ -581,7 +581,10 @@ function Restore-Networks {
 }
 
 function Restore-Volumes {
-    param([string]$BackupPath)
+    param(
+        [string]$BackupPath,
+        [hashtable]$ContainerVolumeOwners = @{}
+    )
     
     Write-Log "Restoring Docker volumes..." -Level info
     
@@ -670,6 +673,21 @@ function Restore-Volumes {
                         $extractOutput = Get-Content "$env:TEMP\tar_extract.log" -Raw -ErrorAction SilentlyContinue
                         if ($extractOutput) {
                             Write-Log "Extraction output: $extractOutput" -Level debug
+                        }
+                        
+                        # Fix ownership if we know which container uses this volume
+                        if ($ContainerVolumeOwners.ContainsKey($volumeName)) {
+                            $ownerInfo = $ContainerVolumeOwners[$volumeName]
+                            Write-Log "Setting ownership for volume $volumeName to $ownerInfo" -Level debug
+                            $chownArgs = @('run', '--rm', '-v', "${volumeName}:/volume", 'busybox', 'chown', '-R', $ownerInfo, '/volume')
+                            $chownProcess = Start-Process -FilePath 'docker' -ArgumentList $chownArgs -Wait -PassThru -NoNewWindow -RedirectStandardError "$env:TEMP\chown_err.log"
+                            
+                            if ($chownProcess.ExitCode -ne 0) {
+                                $chownError = Get-Content "$env:TEMP\chown_err.log" -Raw -ErrorAction SilentlyContinue
+                                Write-Log "Warning: Failed to set ownership: $chownError" -Level warn
+                            } else {
+                                Write-Log "Ownership set successfully" -Level debug
+                            }
                         }
                         
                         Write-Log "Archive extracted successfully to volume: $volumeName" -Level debug
@@ -1303,8 +1321,23 @@ function Main {
         $success = $false
     }
     
+    # Build volume ownership map from container configs
+    # This allows us to set correct file ownership when restoring volumes
+    $volumeOwners = @{}
+    foreach ($container in $script:Manifest.containers) {
+        if ($container.user -and $container.volumes) {
+            foreach ($volume in $container.volumes) {
+                if ($volume.type -eq 'volume' -and $volume.name) {
+                    # Map volume name to user (e.g., "node" or "1000:1000")
+                    $volumeOwners[$volume.name] = $container.user
+                    Write-Log "Volume $($volume.name) should be owned by $($container.user)" -Level debug
+                }
+            }
+        }
+    }
+    
     # Restore volumes
-    if (-not (Restore-Volumes $BackupRoot)) {
+    if (-not (Restore-Volumes $BackupRoot $volumeOwners)) {
         $success = $false
     }
     
