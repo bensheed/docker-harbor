@@ -639,24 +639,131 @@ function Restore-Volumes {
                     $archiveSize = [math]::Round($volumeFile.Length / 1MB, 2)
                     Write-Log "Archive file: $($volumeFile.FullName) (${archiveSize}MB)" -Level debug
                     
-                    # Copy archive into container
+                    # Copy archive into container with Windows-specific handling
                     Write-Log "Copying archive to extraction container..." -Level debug
-                    $copyInArgs = @('cp', $volumeFile.FullName, "${extractContainer}:/archive.tar.gz")
-                    $copyProcess = Start-Process -FilePath 'docker' -ArgumentList $copyInArgs -Wait -PassThru -NoNewWindow -RedirectStandardError "$env:TEMP\copy_err.log"
-                    if ($copyProcess.ExitCode -ne 0) {
-                        $copyError = Get-Content "$env:TEMP\copy_err.log" -Raw -ErrorAction SilentlyContinue
-                        Write-Log "Failed to copy archive to container: $copyError" -Level error
-                        docker rm $extractContainer 2>&1 | Out-Null
-                        throw "Failed to copy archive to container: $copyError"
+                    
+                    # Try multiple approaches for Windows Docker cp reliability
+                    $copySuccess = $false
+                    $copyAttempts = 0
+                    $maxAttempts = 3
+                    
+                    while (-not $copySuccess -and $copyAttempts -lt $maxAttempts) {
+                        $copyAttempts++
+                        Write-Log "Copy attempt $copyAttempts of $maxAttempts" -Level debug
+                        
+                        # Use short path if possible to avoid Windows path issues
+                        $sourcePath = $volumeFile.FullName
+                        if ($sourcePath.Length -gt 260) {
+                            Write-Log "Long path detected, attempting to use short path" -Level debug
+                            try {
+                                $shortPath = (Get-Item $sourcePath).PSPath -replace 'Microsoft\.PowerShell\.Core\\FileSystem::', ''
+                                if ($shortPath -ne $sourcePath) {
+                                    $sourcePath = $shortPath
+                                    Write-Log "Using short path: $sourcePath" -Level debug
+                                }
+                            } catch {
+                                Write-Log "Could not get short path, using original: $($_.Exception.Message)" -Level debug
+                            }
+                        }
+                        
+                        # Ensure file is not locked
+                        Start-Sleep -Milliseconds 500
+                        
+                        # Use quoted paths and explicit timeout
+                        $copyInArgs = @('cp', "`"$sourcePath`"", "${extractContainer}:/archive.tar.gz")
+                        Write-Log "Copy command: docker $($copyInArgs -join ' ')" -Level debug
+                        
+                        $copyProcess = Start-Process -FilePath 'docker' -ArgumentList $copyInArgs -Wait -PassThru -NoNewWindow -RedirectStandardOutput "$env:TEMP\copy_out_$copyAttempts.log" -RedirectStandardError "$env:TEMP\copy_err_$copyAttempts.log"
+                        
+                        $copyError = Get-Content "$env:TEMP\copy_err_$copyAttempts.log" -Raw -ErrorAction SilentlyContinue
+                        $copyOutput = Get-Content "$env:TEMP\copy_out_$copyAttempts.log" -Raw -ErrorAction SilentlyContinue
+                        
+                        Write-Log "Copy exit code: $($copyProcess.ExitCode)" -Level debug
+                        if ($copyOutput) { Write-Log "Copy output: $copyOutput" -Level debug }
+                        if ($copyError) { Write-Log "Copy stderr: $copyError" -Level debug }
+                        
+                        if ($copyProcess.ExitCode -eq 0) {
+                            # Verify the file actually exists in container before declaring success
+                            Write-Log "Verifying file was actually copied..." -Level debug
+                            $verifyArgs = @('exec', $extractContainer, 'ls', '-la', '/archive.tar.gz')
+                            $verifyProcess = Start-Process -FilePath 'docker' -ArgumentList $verifyArgs -Wait -PassThru -NoNewWindow -RedirectStandardOutput "$env:TEMP\verify_$copyAttempts.log" -RedirectStandardError "$env:TEMP\verify_err_$copyAttempts.log"
+                            
+                            if ($verifyProcess.ExitCode -eq 0) {
+                                $verifyOutput = Get-Content "$env:TEMP\verify_$copyAttempts.log" -Raw -ErrorAction SilentlyContinue
+                                if ($verifyOutput -and $verifyOutput.Contains('/archive.tar.gz')) {
+                                    Write-Log "File successfully copied and verified in container" -Level debug
+                                    Write-Log "Archive in container: $verifyOutput" -Level debug
+                                    $copySuccess = $true
+                                } else {
+                                    Write-Log "File copy reported success but verification failed - file not found in container" -Level warn
+                                }
+                            } else {
+                                $verifyError = Get-Content "$env:TEMP\verify_err_$copyAttempts.log" -Raw -ErrorAction SilentlyContinue
+                                Write-Log "File verification failed: $verifyError" -Level warn
+                            }
+                        } else {
+                            Write-Log "Copy failed with exit code: $($copyProcess.ExitCode)" -Level warn
+                            Write-Log "Copy error: $copyError" -Level warn
+                        }
+                        
+                        if (-not $copySuccess -and $copyAttempts -lt $maxAttempts) {
+                            Write-Log "Copy attempt $copyAttempts failed, retrying in 2 seconds..." -Level warn
+                            Start-Sleep -Seconds 2
+                        }
                     }
                     
-                    # Verify archive was copied correctly
-                    $verifyArgs = @('run', '--rm', '--volumes-from', $extractContainer, 'busybox', 'ls', '-la', '/archive.tar.gz')
-                    $verifyProcess = Start-Process -FilePath 'docker' -ArgumentList $verifyArgs -Wait -PassThru -NoNewWindow -RedirectStandardOutput "$env:TEMP\verify.log"
-                    if ($verifyProcess.ExitCode -eq 0) {
-                        $verifyOutput = Get-Content "$env:TEMP\verify.log" -Raw -ErrorAction SilentlyContinue
-                        Write-Log "Archive in container: $verifyOutput" -Level debug
+                    if (-not $copySuccess) {
+                        Write-Log "Direct copy failed, trying alternative approach with volume mount..." -Level warn
+                        
+                        # Alternative approach: Use a temporary volume to transfer the file
+                        try {
+                            # Create a temporary volume for file transfer
+                            $tempVolume = "temp-transfer-$(Get-Random)"
+                            Write-Log "Creating temporary volume: $tempVolume" -Level debug
+                            docker volume create $tempVolume 2>&1 | Out-Null
+                            
+                            # Copy file to temporary volume using a helper container
+                            Write-Log "Copying archive to temporary volume..." -Level debug
+                            $tempCopyArgs = @('run', '--rm', '-v', "${tempVolume}:/transfer", '-v', "${sourcePath}:/source/archive.tar.gz:ro", 'busybox', 'cp', '/source/archive.tar.gz', '/transfer/archive.tar.gz')
+                            $tempCopyProcess = Start-Process -FilePath 'docker' -ArgumentList $tempCopyArgs -Wait -PassThru -NoNewWindow -RedirectStandardOutput "$env:TEMP\temp_copy.log" -RedirectStandardError "$env:TEMP\temp_copy_err.log"
+                            
+                            if ($tempCopyProcess.ExitCode -eq 0) {
+                                # Now copy from temporary volume to extraction container
+                                Write-Log "Copying from temporary volume to extraction container..." -Level debug
+                                $finalCopyArgs = @('run', '--rm', '--volumes-from', $extractContainer, '-v', "${tempVolume}:/transfer", 'busybox', 'cp', '/transfer/archive.tar.gz', '/archive.tar.gz')
+                                $finalCopyProcess = Start-Process -FilePath 'docker' -ArgumentList $finalCopyArgs -Wait -PassThru -NoNewWindow -RedirectStandardOutput "$env:TEMP\final_copy.log" -RedirectStandardError "$env:TEMP\final_copy_err.log"
+                                
+                                if ($finalCopyProcess.ExitCode -eq 0) {
+                                    # Verify the file exists
+                                    $verifyArgs = @('exec', $extractContainer, 'ls', '-la', '/archive.tar.gz')
+                                    $verifyProcess = Start-Process -FilePath 'docker' -ArgumentList $verifyArgs -Wait -PassThru -NoNewWindow -RedirectStandardOutput "$env:TEMP\alt_verify.log"
+                                    
+                                    if ($verifyProcess.ExitCode -eq 0) {
+                                        $verifyOutput = Get-Content "$env:TEMP\alt_verify.log" -Raw -ErrorAction SilentlyContinue
+                                        if ($verifyOutput -and $verifyOutput.Contains('/archive.tar.gz')) {
+                                            Write-Log "Alternative copy method succeeded!" -Level info
+                                            Write-Log "Archive in container: $verifyOutput" -Level debug
+                                            $copySuccess = $true
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            # Clean up temporary volume
+                            Write-Log "Cleaning up temporary volume: $tempVolume" -Level debug
+                            docker volume rm $tempVolume 2>&1 | Out-Null
+                            
+                        } catch {
+                            Write-Log "Alternative copy method also failed: $($_.Exception.Message)" -Level error
+                        }
+                        
+                        if (-not $copySuccess) {
+                            Write-Log "All copy methods failed after $maxAttempts attempts" -Level error
+                            docker rm $extractContainer 2>&1 | Out-Null
+                            throw "Failed to copy archive to container using all available methods"
+                        }
                     }
+
                     
                     # Test archive integrity first
                     Write-Log "Testing archive integrity..." -Level debug
