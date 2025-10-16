@@ -1332,14 +1332,36 @@ function Main {
     $volumeOwners = @{}
     foreach ($container in $script:Manifest.containers) {
         if ($container.user -and $container.volumes) {
+            # Convert username to numeric UID:GID by looking it up in the container image
+            # Busybox doesn't have user databases, so we need numeric IDs
+            $numericUser = $container.user
+            if ($container.user -notmatch '^\d+:\d+$') {
+                # Username, not numeric - need to resolve it
+                Write-Log "Resolving username '$($container.user)' to numeric UID:GID using image $($container.image)" -Level debug
+                try {
+                    $idOutput = docker run --rm $container.image sh -c "id -u $($container.user) && id -g $($container.user)" 2>&1
+                    if ($LASTEXITCODE -eq 0 -and $idOutput) {
+                        $lines = $idOutput -split "`n" | Where-Object { $_ -match '^\d+$' }
+                        if ($lines.Count -ge 2) {
+                            $numericUser = "$($lines[0].Trim()):$($lines[1].Trim())"
+                            Write-Log "Resolved '$($container.user)' to $numericUser" -Level debug
+                        }
+                    } else {
+                        Write-Log "Could not resolve user '$($container.user)' to numeric ID, will use as-is: $idOutput" -Level warn
+                    }
+                } catch {
+                    Write-Log "Failed to resolve user '$($container.user)': $_" -Level warn
+                }
+            }
+            
             foreach ($volume in $container.volumes) {
                 if ($volume.type -eq 'volume' -and $volume.name) {
-                    # Map volume name to user from container config (e.g., "node", "postgres", "1000:1000")
-                    if ($volumeOwners.ContainsKey($volume.name) -and $volumeOwners[$volume.name] -ne $container.user) {
-                        Write-Log "Warning: Volume $($volume.name) is used by multiple containers with different users. Using $($container.user)" -Level warn
+                    # Map volume name to user from container config (e.g., "1000:1000" resolved from "node")
+                    if ($volumeOwners.ContainsKey($volume.name) -and $volumeOwners[$volume.name] -ne $numericUser) {
+                        Write-Log "Warning: Volume $($volume.name) is used by multiple containers with different users. Using $numericUser" -Level warn
                     }
-                    $volumeOwners[$volume.name] = $container.user
-                    Write-Log "Volume $($volume.name) will be owned by $($container.user)" -Level debug
+                    $volumeOwners[$volume.name] = $numericUser
+                    Write-Log "Volume $($volume.name) will be owned by $numericUser" -Level debug
                 }
             }
         }
