@@ -718,6 +718,26 @@ function Restore-Volumes {
                                             }
                                         }
                                         
+                                        # If username found but not numeric, try common mappings first
+                                        if (-not $numericUser -and $imageUser) {
+                                            # Common username to UID:GID mappings
+                                            $commonUsers = @{
+                                                'node' = '1000:1000'
+                                                'nginx' = '101:101'
+                                                'www-data' = '33:33'
+                                                'postgres' = '999:999'
+                                                'mysql' = '999:999'
+                                                'redis' = '999:999'
+                                                'mongodb' = '999:999'
+                                                'elasticsearch' = '1000:1000'
+                                            }
+                                            
+                                            if ($commonUsers.ContainsKey($imageUser)) {
+                                                $numericUser = $commonUsers[$imageUser]
+                                                Write-Log "Resolved '$imageUser' to $numericUser using common user mapping" -Level debug
+                                            }
+                                        }
+                                        
                                         # If still not resolved, try running id command (works for images with shell)
                                         if (-not $numericUser) {
                                             Write-Log "Attempting to resolve by running id command in container" -Level debug
@@ -1078,8 +1098,11 @@ function Restore-Containers {
                             }
                         }
                         catch {
-                            Write-Log ("Failed to map port " + $port.host_port + ": " + $_) -Level error
-                            if ($PortStrategy -eq 'fail') {
+                            $errorMsg = $_
+                            Write-Log ("Failed to map port " + $port.host_port + ": " + $errorMsg) -Level error
+                            
+                            # Re-throw if user cancelled or if PortStrategy is 'fail'
+                            if ($errorMsg -match "cancelled by user" -or $PortStrategy -eq 'fail') {
                                 throw
                             }
                         }
