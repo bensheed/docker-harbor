@@ -989,6 +989,18 @@ function Restore-Containers {
                     Write-Log "Using original image for container: $($container.name) -> $imageToUse" -Level debug
                 }
                 
+                # Verify image exists
+                $imageExists = docker images --format "{{.Repository}}:{{.Tag}}" | Select-String -Pattern "^$([regex]::Escape($imageToUse))$" -Quiet
+                if (-not $imageExists) {
+                    # Try without tag
+                    $imageBase = $imageToUse -replace ':.*$', ''
+                    $imageExists = docker images --format "{{.Repository}}" | Select-String -Pattern "^$([regex]::Escape($imageBase))$" -Quiet
+                    if (-not $imageExists) {
+                        throw "Image not found: $imageToUse. Make sure images were loaded successfully."
+                    }
+                }
+                Write-Log "Verified image exists: $imageToUse" -Level debug
+                
                 # Handle entrypoint: --entrypoint only accepts ONE value (the executable)
                 # Any additional entrypoint args must be part of the command
                 $entrypointExec = $null
