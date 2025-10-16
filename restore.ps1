@@ -684,8 +684,9 @@ function Restore-Volumes {
                         
                         if ($copyProcess.ExitCode -eq 0) {
                             # Verify the file actually exists in container before declaring success
+                            # Use 'docker run --volumes-from' since the container is stopped
                             Write-Log "Verifying file was actually copied..." -Level debug
-                            $verifyArgs = @('exec', $extractContainer, 'ls', '-la', '/archive.tar.gz')
+                            $verifyArgs = @('run', '--rm', '--volumes-from', $extractContainer, 'busybox', 'ls', '-la', '/archive.tar.gz')
                             $verifyProcess = Start-Process -FilePath 'docker' -ArgumentList $verifyArgs -Wait -PassThru -NoNewWindow -RedirectStandardOutput "$env:TEMP\verify_$copyAttempts.log" -RedirectStandardError "$env:TEMP\verify_err_$copyAttempts.log"
                             
                             if ($verifyProcess.ExitCode -eq 0) {
@@ -734,9 +735,9 @@ function Restore-Volumes {
                                 $finalCopyProcess = Start-Process -FilePath 'docker' -ArgumentList $finalCopyArgs -Wait -PassThru -NoNewWindow -RedirectStandardOutput "$env:TEMP\final_copy.log" -RedirectStandardError "$env:TEMP\final_copy_err.log"
                                 
                                 if ($finalCopyProcess.ExitCode -eq 0) {
-                                    # Verify the file exists
-                                    $verifyArgs = @('exec', $extractContainer, 'ls', '-la', '/archive.tar.gz')
-                                    $verifyProcess = Start-Process -FilePath 'docker' -ArgumentList $verifyArgs -Wait -PassThru -NoNewWindow -RedirectStandardOutput "$env:TEMP\alt_verify.log"
+                                    # Verify the file exists using volumes-from since container is stopped
+                                    $verifyArgs = @('run', '--rm', '--volumes-from', $extractContainer, 'busybox', 'ls', '-la', '/archive.tar.gz')
+                                    $verifyProcess = Start-Process -FilePath 'docker' -ArgumentList $verifyArgs -Wait -PassThru -NoNewWindow -RedirectStandardOutput "$env:TEMP\alt_verify.log" -RedirectStandardError "$env:TEMP\alt_verify_err.log"
                                     
                                     if ($verifyProcess.ExitCode -eq 0) {
                                         $verifyOutput = Get-Content "$env:TEMP\alt_verify.log" -Raw -ErrorAction SilentlyContinue
