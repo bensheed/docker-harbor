@@ -1322,15 +1322,24 @@ function Main {
     }
     
     # Build volume ownership map from container configs
-    # This allows us to set correct file ownership when restoring volumes
+    # This fixes a common issue: when restoring volumes, extracted files are owned by root,
+    # but containers often run as non-root users (node, postgres, redis, etc.)
+    # Without this, containers get permission denied errors when accessing their own data.
+    # 
+    # This is GENERIC - works for any container that specifies a user in its config.
+    # If multiple containers share a volume with different users, the last one wins
+    # (which may not be ideal, but is better than root-owned files).
     $volumeOwners = @{}
     foreach ($container in $script:Manifest.containers) {
         if ($container.user -and $container.volumes) {
             foreach ($volume in $container.volumes) {
                 if ($volume.type -eq 'volume' -and $volume.name) {
-                    # Map volume name to user (e.g., "node" or "1000:1000")
+                    # Map volume name to user from container config (e.g., "node", "postgres", "1000:1000")
+                    if ($volumeOwners.ContainsKey($volume.name) -and $volumeOwners[$volume.name] -ne $container.user) {
+                        Write-Log "Warning: Volume $($volume.name) is used by multiple containers with different users. Using $($container.user)" -Level warn
+                    }
                     $volumeOwners[$volume.name] = $container.user
-                    Write-Log "Volume $($volume.name) should be owned by $($container.user)" -Level debug
+                    Write-Log "Volume $($volume.name) will be owned by $($container.user)" -Level debug
                 }
             }
         }
