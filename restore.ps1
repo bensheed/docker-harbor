@@ -1104,19 +1104,17 @@ function Restore-Containers {
                 # Execute docker run
                 Write-Log "Running: docker $($runArgs -join ' ')" -Level debug
                 
-                # Capture both stdout and stderr
-                $tempOut = [System.IO.Path]::GetTempFileName()
-                $tempErr = [System.IO.Path]::GetTempFileName()
+                # Use native PowerShell invocation instead of Start-Process to properly handle arguments with spaces
+                # Redirect stderr to capture Docker errors
+                $output = & docker $runArgs 2>&1
+                $exitCode = $LASTEXITCODE
                 
-                $process = Start-Process -FilePath 'docker' -ArgumentList $runArgs -Wait -PassThru -NoNewWindow `
-                    -RedirectStandardOutput $tempOut -RedirectStandardError $tempErr
-                
-                $stdout = Get-Content $tempOut -Raw -ErrorAction SilentlyContinue
-                $stderr = Get-Content $tempErr -Raw -ErrorAction SilentlyContinue
-                Remove-Item $tempOut, $tempErr -ErrorAction SilentlyContinue
-                
-                if ($process.ExitCode -ne 0) {
-                    $errorMsg = "Container creation failed with exit code $($process.ExitCode)"
+                if ($exitCode -ne 0) {
+                    # Separate stdout and stderr from combined output
+                    $stderr = ($output | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] } | ForEach-Object { $_.Exception.Message }) -join "`n"
+                    $stdout = ($output | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] } | Out-String).Trim()
+                    
+                    $errorMsg = "Container creation failed with exit code $exitCode"
                     if ($stderr) {
                         $errorMsg += "`nDocker error: $stderr"
                         Write-Log "Docker stderr: $stderr" -Level debug
