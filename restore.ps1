@@ -651,29 +651,34 @@ function Restore-Volumes {
                     docker volume create $tempVolume 2>&1 | Out-Null
                     
                     try {
-                        # Use short path if possible to avoid Windows path issues
-                        $sourcePath = $volumeFile.FullName
-                        if ($sourcePath.Length -gt 260) {
-                            Write-Log "Long path detected, attempting to use short path" -Level debug
-                            try {
-                                $shortPath = (Get-Item $sourcePath).PSPath -replace 'Microsoft\.PowerShell\.Core\\FileSystem::', ''
-                                if ($shortPath -ne $sourcePath) {
-                                    $sourcePath = $shortPath
-                                    Write-Log "Using short path: $sourcePath" -Level debug
-                                }
-                            } catch {
-                                Write-Log "Could not get short path, using original: $($_.Exception.Message)" -Level debug
-                            }
+                        # Copy to simple temporary path first to avoid Windows filesystem issues
+                        $tempDir = "$env:TEMP\docker-restore"
+                        $tempFilePath = "$tempDir\archive.tar.gz"
+                        
+                        # Ensure temp directory exists
+                        if (-not (Test-Path $tempDir)) {
+                            New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
+                            Write-Log "Created temporary directory: $tempDir" -Level debug
                         }
                         
-                        # Copy file to temporary volume using a helper container
-                        # Mount parent directory to avoid Windows file mounting issues
-                        $sourceDir = Split-Path $sourcePath -Parent
-                        $sourceFileName = Split-Path $sourcePath -Leaf
-                        Write-Log "Copying archive to temporary volume..." -Level debug
-                        Write-Log "Source directory: $sourceDir" -Level debug
-                        Write-Log "Source filename: $sourceFileName" -Level debug
-                        $tempCopyArgs = @('run', '--rm', '-v', "${tempVolume}:/transfer", '-v', "`"${sourceDir}`":/source:ro", 'busybox', 'cp', "/source/${sourceFileName}", '/transfer/archive.tar.gz')
+                        # Copy archive to simple temp path
+                        Write-Log "Copying archive to temporary location to avoid Windows path issues..." -Level debug
+                        Write-Log "Source: $($volumeFile.FullName)" -Level debug
+                        Write-Log "Temp location: $tempFilePath" -Level debug
+                        
+                        Copy-Item -Path $volumeFile.FullName -Destination $tempFilePath -Force
+                        
+                        # Verify temp file was created successfully
+                        if (-not (Test-Path $tempFilePath)) {
+                            throw "Failed to copy archive to temporary location"
+                        }
+                        
+                        $tempFileSize = [math]::Round((Get-Item $tempFilePath).Length / 1MB, 2)
+                        Write-Log "Temporary file created successfully: ${tempFileSize}MB" -Level debug
+                        
+                        # Copy file to temporary volume using simple temp path
+                        Write-Log "Copying archive from temp location to temporary volume..." -Level debug
+                        $tempCopyArgs = @('run', '--rm', '-v', "${tempVolume}:/transfer", '-v', "`"${tempFilePath}`":/source/archive.tar.gz:ro", 'busybox', 'cp', '/source/archive.tar.gz', '/transfer/archive.tar.gz')
                         Write-Log "Temp copy command: docker $($tempCopyArgs -join ' ')" -Level debug
                         $tempCopyProcess = Start-Process -FilePath 'docker' -ArgumentList $tempCopyArgs -Wait -PassThru -NoNewWindow -RedirectStandardOutput "$env:TEMP\temp_copy.log" -RedirectStandardError "$env:TEMP\temp_copy_err.log"
                         
@@ -728,6 +733,13 @@ function Restore-Volumes {
                         # Clean up temporary volume
                         Write-Log "Cleaning up temporary volume: $tempVolume" -Level debug
                         docker volume rm $tempVolume 2>&1 | Out-Null
+                        
+                        # Clean up temporary file if it exists
+                        $tempFilePath = "$env:TEMP\docker-restore\archive.tar.gz"
+                        if (Test-Path $tempFilePath) {
+                            Write-Log "Cleaning up temporary file: $tempFilePath" -Level debug
+                            Remove-Item $tempFilePath -Force -ErrorAction SilentlyContinue
+                        }
                     }
                     
                     if (-not $copySuccess) {
