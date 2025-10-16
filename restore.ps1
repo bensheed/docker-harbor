@@ -583,7 +583,7 @@ function Restore-Networks {
 function Restore-Volumes {
     param(
         [string]$BackupPath,
-        [hashtable]$ContainerVolumeOwners = @{}
+        [hashtable]$VolumeOwnerInfo = @{}
     )
     
     Write-Log "Restoring Docker volumes..." -Level info
@@ -676,15 +676,21 @@ function Restore-Volumes {
                         }
                         
                         # Fix ownership if we know which container uses this volume
-                        if ($ContainerVolumeOwners.ContainsKey($volumeName)) {
-                            $ownerInfo = $ContainerVolumeOwners[$volumeName]
-                            Write-Log "Setting ownership for volume $volumeName to $ownerInfo" -Level debug
-                            $chownArgs = @('run', '--rm', '-v', "${volumeName}:/volume", 'busybox', 'chown', '-R', $ownerInfo, '/volume')
+                        if ($VolumeOwnerInfo.ContainsKey($volumeName)) {
+                            $ownerData = $VolumeOwnerInfo[$volumeName]
+                            $user = $ownerData.user
+                            $image = $ownerData.image
+                            
+                            Write-Log "Setting ownership for volume $volumeName to '$user' using image $image" -Level debug
+                            
+                            # Use the actual container image for chown - it knows about the user
+                            # This avoids needing to resolve usernames to numeric IDs
+                            $chownArgs = @('run', '--rm', '-v', "${volumeName}:/volume", $image, 'chown', '-R', $user, '/volume')
                             $chownProcess = Start-Process -FilePath 'docker' -ArgumentList $chownArgs -Wait -PassThru -NoNewWindow -RedirectStandardError "$env:TEMP\chown_err.log"
                             
                             if ($chownProcess.ExitCode -ne 0) {
                                 $chownError = Get-Content "$env:TEMP\chown_err.log" -Raw -ErrorAction SilentlyContinue
-                                Write-Log "Warning: Failed to set ownership: $chownError" -Level warn
+                                Write-Log "Warning: Failed to set ownership using image's chown: $chownError" -Level warn
                             } else {
                                 Write-Log "Ownership set successfully" -Level debug
                             }
@@ -1329,39 +1335,28 @@ function Main {
     # This is GENERIC - works for any container that specifies a user in its config.
     # If multiple containers share a volume with different users, the last one wins
     # (which may not be ideal, but is better than root-owned files).
+    # 
+    # We store both the username AND the image, so we can use that image's chown command
+    # (which understands the username). This is simpler than resolving to numeric IDs.
     $volumeOwners = @{}
     foreach ($container in $script:Manifest.containers) {
-        if ($container.user -and $container.volumes) {
-            # Convert username to numeric UID:GID by looking it up in the container image
-            # Busybox doesn't have user databases, so we need numeric IDs
-            $numericUser = $container.user
-            if ($container.user -notmatch '^\d+:\d+$') {
-                # Username, not numeric - need to resolve it
-                Write-Log "Resolving username '$($container.user)' to numeric UID:GID using image $($container.image)" -Level debug
-                try {
-                    $idOutput = docker run --rm $container.image sh -c "id -u $($container.user) && id -g $($container.user)" 2>&1
-                    if ($LASTEXITCODE -eq 0 -and $idOutput) {
-                        $lines = $idOutput -split "`n" | Where-Object { $_ -match '^\d+$' }
-                        if ($lines.Count -ge 2) {
-                            $numericUser = "$($lines[0].Trim()):$($lines[1].Trim())"
-                            Write-Log "Resolved '$($container.user)' to $numericUser" -Level debug
-                        }
-                    } else {
-                        Write-Log "Could not resolve user '$($container.user)' to numeric ID, will use as-is: $idOutput" -Level warn
-                    }
-                } catch {
-                    Write-Log "Failed to resolve user '$($container.user)': $_" -Level warn
-                }
-            }
-            
+        if ($container.user -and $container.volumes -and $container.image) {
             foreach ($volume in $container.volumes) {
                 if ($volume.type -eq 'volume' -and $volume.name) {
-                    # Map volume name to user from container config (e.g., "1000:1000" resolved from "node")
-                    if ($volumeOwners.ContainsKey($volume.name) -and $volumeOwners[$volume.name] -ne $numericUser) {
-                        Write-Log "Warning: Volume $($volume.name) is used by multiple containers with different users. Using $numericUser" -Level warn
+                    $ownerData = @{
+                        user = $container.user
+                        image = $container.image
                     }
-                    $volumeOwners[$volume.name] = $numericUser
-                    Write-Log "Volume $($volume.name) will be owned by $numericUser" -Level debug
+                    
+                    if ($volumeOwners.ContainsKey($volume.name)) {
+                        $existing = $volumeOwners[$volume.name]
+                        if ($existing.user -ne $ownerData.user) {
+                            Write-Log "Warning: Volume $($volume.name) is used by multiple containers with different users. Using $($ownerData.user)" -Level warn
+                        }
+                    }
+                    
+                    $volumeOwners[$volume.name] = $ownerData
+                    Write-Log "Volume $($volume.name) will be owned by '$($ownerData.user)' (via image $($ownerData.image))" -Level debug
                 }
             }
         }
