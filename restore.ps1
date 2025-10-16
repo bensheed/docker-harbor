@@ -680,111 +680,46 @@ function Restore-Volumes {
                             $ownerData = $VolumeOwnerInfo[$volumeName]
                             $user = $ownerData.user
                             $image = $ownerData.image
+                            $uid = $ownerData.uid
+                            $gid = $ownerData.gid
                             
-                            Write-Log "Setting ownership for volume $volumeName to '$user' using image $image" -Level debug
+                            # Strategy: Use numeric UID/GID if available (captured during backup)
+                            $numericUser = $null
+                            if ($uid -and $gid) {
+                                $numericUser = "${uid}:${gid}"
+                                Write-Log "Using UID/GID from backup manifest: $numericUser" -Level info
+                            } elseif ($user -match '^\d+:\d+$') {
+                                # Username is already numeric
+                                $numericUser = $user
+                                Write-Log "Username is already numeric: $numericUser" -Level debug
+                            }
                             
-                            # Try using the actual container image for chown - it knows about the user
-                            $chownArgs = @('run', '--rm', '-v', "${volumeName}:/volume", $image, 'chown', '-R', $user, '/volume')
-                            $chownProcess = Start-Process -FilePath 'docker' -ArgumentList $chownArgs -Wait -PassThru -NoNewWindow -RedirectStandardError "$env:TEMP\chown_err.log"
-                            
-                            if ($chownProcess.ExitCode -ne 0) {
-                                $chownError = Get-Content "$env:TEMP\chown_err.log" -Raw -ErrorAction SilentlyContinue
-                                Write-Log "Failed to set ownership using image's chown: $chownError" -Level debug
+                            # If we have numeric UID/GID, use busybox directly (always works)
+                            if ($numericUser) {
+                                Write-Log "Setting ownership for volume $volumeName to UID:GID $numericUser using busybox" -Level debug
+                                $chownArgs = @('run', '--rm', '-v', "${volumeName}:/volume", 'busybox', 'chown', '-R', $numericUser, '/volume')
+                                $chownProcess = Start-Process -FilePath 'docker' -ArgumentList $chownArgs -Wait -PassThru -NoNewWindow -RedirectStandardError "$env:TEMP\chown_err.log"
                                 
-                                # Fallback: resolve username to numeric UID:GID and use busybox
-                                Write-Log "Attempting fallback: resolving '$user' to numeric UID:GID" -Level debug
-                                
-                                $numericUser = $null
-                                if ($user -match '^\d+:\d+$') {
-                                    # Already numeric
-                                    $numericUser = $user
+                                if ($chownProcess.ExitCode -eq 0) {
+                                    Write-Log "Successfully set ownership to $numericUser" -Level info
                                 } else {
-                                    # Try to resolve using image inspection first (works for distroless images)
-                                    try {
-                                        Write-Log "Inspecting image $image for user configuration" -Level debug
-                                        $inspectOutput = docker inspect $image 2>&1 | ConvertFrom-Json
-                                        if ($inspectOutput -and $inspectOutput[0].Config.User) {
-                                            $imageUser = $inspectOutput[0].Config.User
-                                            Write-Log "Image user from metadata: $imageUser" -Level debug
-                                            
-                                            # Check if it's numeric
-                                            if ($imageUser -match '^\d+:\d+$') {
-                                                $numericUser = $imageUser
-                                                Write-Log "Found numeric user in image metadata: $numericUser" -Level debug
-                                            } elseif ($imageUser -match '^\d+$') {
-                                                # Just UID, no GID - assume same as UID
-                                                $numericUser = "${imageUser}:${imageUser}"
-                                                Write-Log "Found numeric UID in image metadata, using same for GID: $numericUser" -Level debug
-                                            }
-                                        }
-                                        
-                                        # If username found but not numeric, try common mappings first
-                                        if (-not $numericUser -and $imageUser) {
-                                            # Common username to UID:GID mappings
-                                            $commonUsers = @{
-                                                'node' = '1000:1000'
-                                                'nginx' = '101:101'
-                                                'www-data' = '33:33'
-                                                'postgres' = '999:999'
-                                                'mysql' = '999:999'
-                                                'redis' = '999:999'
-                                                'mongodb' = '999:999'
-                                                'elasticsearch' = '1000:1000'
-                                            }
-                                            
-                                            if ($commonUsers.ContainsKey($imageUser)) {
-                                                $numericUser = $commonUsers[$imageUser]
-                                                Write-Log "Resolved '$imageUser' to $numericUser using common user mapping" -Level debug
-                                            }
-                                        }
-                                        
-                                        # If still not resolved, try running id command (works for images with shell)
-                                        if (-not $numericUser) {
-                                            Write-Log "Attempting to resolve by running id command in container" -Level debug
-                                            $idCommand = "id -u $user && id -g $user"
-                                            $idArgs = @('run', '--rm', $image, 'sh', '-c', $idCommand)
-                                            $idProcess = Start-Process -FilePath 'docker' -ArgumentList $idArgs -Wait -PassThru -NoNewWindow -RedirectStandardOutput "$env:TEMP\id_out.log" -RedirectStandardError "$env:TEMP\id_err.log"
-                                            
-                                            if ($idProcess.ExitCode -eq 0) {
-                                                $idOutput = Get-Content "$env:TEMP\id_out.log" -Raw -ErrorAction SilentlyContinue
-                                                Write-Log "ID command output: $idOutput" -Level debug
-                                                
-                                                $lines = $idOutput -split "`n" | Where-Object { $_.Trim() -match '^\d+$' }
-                                                if ($lines.Count -ge 2) {
-                                                    $uid = $lines[0].Trim()
-                                                    $gid = $lines[1].Trim()
-                                                    $numericUser = "${uid}:${gid}"
-                                                    Write-Log "Resolved '$user' to $numericUser using id command" -Level debug
-                                                } else {
-                                                    Write-Log "Could not parse UID:GID from output (found $($lines.Count) numeric lines)" -Level debug
-                                                }
-                                            } else {
-                                                $idError = Get-Content "$env:TEMP\id_err.log" -Raw -ErrorAction SilentlyContinue
-                                                Write-Log "ID command failed (exit code $($idProcess.ExitCode)): $idError" -Level debug
-                                            }
-                                        }
-                                    } catch {
-                                        Write-Log "Could not resolve user '$user' to numeric ID: $_" -Level debug
-                                    }
-                                }
-                                
-                                if ($numericUser) {
-                                    # Use busybox with numeric IDs
-                                    Write-Log "Setting ownership using busybox with numeric ID: $numericUser" -Level debug
-                                    $busyboxArgs = @('run', '--rm', '-v', "${volumeName}:/volume", 'busybox', 'chown', '-R', $numericUser, '/volume')
-                                    $busyboxProcess = Start-Process -FilePath 'docker' -ArgumentList $busyboxArgs -Wait -PassThru -NoNewWindow -RedirectStandardError "$env:TEMP\chown_err2.log"
-                                    
-                                    if ($busyboxProcess.ExitCode -eq 0) {
-                                        Write-Log "Ownership set successfully using busybox" -Level debug
-                                    } else {
-                                        $busyboxError = Get-Content "$env:TEMP\chown_err2.log" -Raw -ErrorAction SilentlyContinue
-                                        Write-Log "Warning: Failed to set ownership using busybox: $busyboxError" -Level warn
-                                    }
-                                } else {
-                                    Write-Log "Warning: Could not resolve user '$user' to numeric ID, skipping ownership fix" -Level warn
+                                    $chownError = Get-Content "$env:TEMP\chown_err.log" -Raw -ErrorAction SilentlyContinue
+                                    Write-Log "Failed to set ownership: $chownError" -Level warn
                                 }
                             } else {
-                                Write-Log "Ownership set successfully" -Level debug
+                                # Fallback: Try using the container image's chown (if it has one)
+                                Write-Log "No numeric UID/GID available, trying image's chown for user '$user'" -Level debug
+                                $chownArgs = @('run', '--rm', '-v', "${volumeName}:/volume", $image, 'chown', '-R', $user, '/volume')
+                                $chownProcess = Start-Process -FilePath 'docker' -ArgumentList $chownArgs -Wait -PassThru -NoNewWindow -RedirectStandardError "$env:TEMP\chown_err.log"
+                                
+                                if ($chownProcess.ExitCode -ne 0) {
+                                    $chownError = Get-Content "$env:TEMP\chown_err.log" -Raw -ErrorAction SilentlyContinue
+                                    Write-Log "Failed to set ownership using image's chown: $chownError" -Level debug
+                                    Write-Log "Skipping ownership fix - container may have permission issues on startup" -Level warn
+                                    Write-Log "Note: Run backup with container running to capture numeric UID/GID for reliable restoration" -Level warn
+                                } else {
+                                    Write-Log "Ownership set successfully" -Level info
+                                }
                             }
                         }
                         
@@ -1427,12 +1362,8 @@ function Main {
     # but containers often run as non-root users (node, postgres, redis, etc.)
     # Without this, containers get permission denied errors when accessing their own data.
     # 
-    # This is GENERIC - works for any container that specifies a user in its config.
-    # If multiple containers share a volume with different users, the last one wins
-    # (which may not be ideal, but is better than root-owned files).
-    # 
-    # We store both the username AND the image, so we can use that image's chown command
-    # (which understands the username). This is simpler than resolving to numeric IDs.
+    # We now capture numeric UID/GID during backup for accurate restoration.
+    # If multiple containers share a volume with different users, the last one wins.
     $volumeOwners = @{}
     foreach ($container in $script:Manifest.containers) {
         if ($container.user -and $container.volumes -and $container.image) {
@@ -1440,6 +1371,8 @@ function Main {
                 if ($volume.type -eq 'volume' -and $volume.name) {
                     $ownerData = @{
                         user = $container.user
+                        uid = $container.uid
+                        gid = $container.gid
                         image = $container.image
                     }
                     
@@ -1451,7 +1384,11 @@ function Main {
                     }
                     
                     $volumeOwners[$volume.name] = $ownerData
-                    Write-Log "Volume $($volume.name) will be owned by '$($ownerData.user)' (via image $($ownerData.image))" -Level debug
+                    if ($ownerData.uid) {
+                        Write-Log "Volume $($volume.name) will be owned by UID:GID ${ownerData.uid}:${ownerData.gid}" -Level debug
+                    } else {
+                        Write-Log "Volume $($volume.name) will be owned by user '$($ownerData.user)' (UID not captured during backup)" -Level debug
+                    }
                 }
             }
         }
