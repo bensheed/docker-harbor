@@ -1022,9 +1022,28 @@ function Restore-Containers {
                 
                 # Execute docker run
                 Write-Log "Running: docker $($runArgs -join ' ')" -Level debug
-                $process = Start-Process -FilePath 'docker' -ArgumentList $runArgs -Wait -PassThru -NoNewWindow
+                
+                # Capture both stdout and stderr
+                $tempOut = [System.IO.Path]::GetTempFileName()
+                $tempErr = [System.IO.Path]::GetTempFileName()
+                
+                $process = Start-Process -FilePath 'docker' -ArgumentList $runArgs -Wait -PassThru -NoNewWindow `
+                    -RedirectStandardOutput $tempOut -RedirectStandardError $tempErr
+                
+                $stdout = Get-Content $tempOut -Raw -ErrorAction SilentlyContinue
+                $stderr = Get-Content $tempErr -Raw -ErrorAction SilentlyContinue
+                Remove-Item $tempOut, $tempErr -ErrorAction SilentlyContinue
+                
                 if ($process.ExitCode -ne 0) {
-                    throw "Container creation failed with exit code $($process.ExitCode)"
+                    $errorMsg = "Container creation failed with exit code $($process.ExitCode)"
+                    if ($stderr) {
+                        $errorMsg += "`nDocker error: $stderr"
+                        Write-Log "Docker stderr: $stderr" -Level debug
+                    }
+                    if ($stdout) {
+                        Write-Log "Docker stdout: $stdout" -Level debug
+                    }
+                    throw $errorMsg
                 }
                 
                 $script:RestoredContainers += $containerName
