@@ -685,7 +685,7 @@ function Restore-Volumes {
                             
                             # Strategy: Use numeric UID/GID if available (captured during backup)
                             $numericUser = $null
-                            if ($uid -and $gid) {
+                            if ($uid -and $gid -and $uid -ne $null -and $gid -ne $null) {
                                 $numericUser = "${uid}:${gid}"
                                 Write-Log "Using UID/GID from backup manifest: $numericUser" -Level info
                             } elseif ($user -match '^\d+:\d+$') {
