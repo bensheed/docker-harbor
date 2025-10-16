@@ -699,29 +699,49 @@ function Restore-Volumes {
                                     # Already numeric
                                     $numericUser = $user
                                 } else {
-                                    # Try to resolve using the container image
+                                    # Try to resolve using image inspection first (works for distroless images)
                                     try {
-                                        # Run id commands to get UID and GID
-                                        $idCommand = "id -u $user && id -g $user"
-                                        $idArgs = @('run', '--rm', $image, 'sh', '-c', $idCommand)
-                                        $idProcess = Start-Process -FilePath 'docker' -ArgumentList $idArgs -Wait -PassThru -NoNewWindow -RedirectStandardOutput "$env:TEMP\id_out.log" -RedirectStandardError "$env:TEMP\id_err.log"
-                                        
-                                        if ($idProcess.ExitCode -eq 0) {
-                                            $idOutput = Get-Content "$env:TEMP\id_out.log" -Raw -ErrorAction SilentlyContinue
-                                            Write-Log "ID command output: $idOutput" -Level debug
+                                        Write-Log "Inspecting image $image for user configuration" -Level debug
+                                        $inspectOutput = docker inspect $image 2>&1 | ConvertFrom-Json
+                                        if ($inspectOutput -and $inspectOutput[0].Config.User) {
+                                            $imageUser = $inspectOutput[0].Config.User
+                                            Write-Log "Image user from metadata: $imageUser" -Level debug
                                             
-                                            $lines = $idOutput -split "`n" | Where-Object { $_.Trim() -match '^\d+$' }
-                                            if ($lines.Count -ge 2) {
-                                                $uid = $lines[0].Trim()
-                                                $gid = $lines[1].Trim()
-                                                $numericUser = "${uid}:${gid}"
-                                                Write-Log "Resolved '$user' to $numericUser" -Level debug
-                                            } else {
-                                                Write-Log "Could not parse UID:GID from output (found $($lines.Count) numeric lines)" -Level debug
+                                            # Check if it's numeric
+                                            if ($imageUser -match '^\d+:\d+$') {
+                                                $numericUser = $imageUser
+                                                Write-Log "Found numeric user in image metadata: $numericUser" -Level debug
+                                            } elseif ($imageUser -match '^\d+$') {
+                                                # Just UID, no GID - assume same as UID
+                                                $numericUser = "${imageUser}:${imageUser}"
+                                                Write-Log "Found numeric UID in image metadata, using same for GID: $numericUser" -Level debug
                                             }
-                                        } else {
-                                            $idError = Get-Content "$env:TEMP\id_err.log" -Raw -ErrorAction SilentlyContinue
-                                            Write-Log "ID command failed (exit code $($idProcess.ExitCode)): $idError" -Level debug
+                                        }
+                                        
+                                        # If still not resolved, try running id command (works for images with shell)
+                                        if (-not $numericUser) {
+                                            Write-Log "Attempting to resolve by running id command in container" -Level debug
+                                            $idCommand = "id -u $user && id -g $user"
+                                            $idArgs = @('run', '--rm', $image, 'sh', '-c', $idCommand)
+                                            $idProcess = Start-Process -FilePath 'docker' -ArgumentList $idArgs -Wait -PassThru -NoNewWindow -RedirectStandardOutput "$env:TEMP\id_out.log" -RedirectStandardError "$env:TEMP\id_err.log"
+                                            
+                                            if ($idProcess.ExitCode -eq 0) {
+                                                $idOutput = Get-Content "$env:TEMP\id_out.log" -Raw -ErrorAction SilentlyContinue
+                                                Write-Log "ID command output: $idOutput" -Level debug
+                                                
+                                                $lines = $idOutput -split "`n" | Where-Object { $_.Trim() -match '^\d+$' }
+                                                if ($lines.Count -ge 2) {
+                                                    $uid = $lines[0].Trim()
+                                                    $gid = $lines[1].Trim()
+                                                    $numericUser = "${uid}:${gid}"
+                                                    Write-Log "Resolved '$user' to $numericUser using id command" -Level debug
+                                                } else {
+                                                    Write-Log "Could not parse UID:GID from output (found $($lines.Count) numeric lines)" -Level debug
+                                                }
+                                            } else {
+                                                $idError = Get-Content "$env:TEMP\id_err.log" -Raw -ErrorAction SilentlyContinue
+                                                Write-Log "ID command failed (exit code $($idProcess.ExitCode)): $idError" -Level debug
+                                            }
                                         }
                                     } catch {
                                         Write-Log "Could not resolve user '$user' to numeric ID: $_" -Level debug
