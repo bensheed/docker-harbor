@@ -1,5 +1,29 @@
 #Requires -Version 5.1
 
+[CmdletBinding()]
+param(
+    [string]$BackupRoot = '',
+    [string[]]$SelectContainers = @(),
+    [ValidateSet('load','skip')]
+    [string]$Images = 'load',
+    [ValidateSet('recreate','skip')]
+    [string]$Networks = 'recreate',
+    [ValidateSet('keep','auto-remap','fail')]
+    [string]$PortStrategy = 'keep',
+    [string]$NameSuffix = '',
+    [string]$BindRoot = '',
+    [ValidateSet('no','always','unless-stopped','on-failure')]
+    [string]$RestartPolicy = '',
+    [switch]$Decrypt,
+    [string]$Passphrase = '',
+    [switch]$DryRun,
+    [switch]$Force,
+    [string]$LogLevel = 'debug',
+    [string]$LogFile = '',
+    [switch]$NonInteractive,
+    [switch]$Help
+)
+
 # Handle execution policy with UAC elevation if needed
 if ((Get-ExecutionPolicy) -eq 'Restricted') {
     # Check if already running as administrator
@@ -80,6 +104,9 @@ if ((Get-ExecutionPolicy) -eq 'Restricted') {
 .PARAMETER LogFile
     Custom log file path
 
+.PARAMETER NonInteractive
+    Run without user prompts (for automation/CI/CD)
+
 .PARAMETER Help
     Show detailed help and examples
 
@@ -98,31 +125,11 @@ if ((Get-ExecutionPolicy) -eq 'Restricted') {
 .EXAMPLE
     .\restore.ps1 --bind-root C:\RestoredData --dry-run
     Preview restore with custom bind mount location
-#>
 
-[CmdletBinding()]
-param(
-    [string]$BackupRoot = '',
-    [string[]]$SelectContainers = @(),
-    [ValidateSet('load','skip')]
-    [string]$Images = 'load',
-    [ValidateSet('recreate','skip')]
-    [string]$Networks = 'recreate',
-    [ValidateSet('keep','auto-remap','fail')]
-    [string]$PortStrategy = 'keep',
-    [string]$NameSuffix = '',
-    [string]$BindRoot = '',
-    [ValidateSet('no','always','unless-stopped','on-failure')]
-    [string]$RestartPolicy = '',
-    [switch]$Decrypt,
-    [string]$Passphrase = '',
-    [switch]$DryRun,
-    [switch]$Force,
-    [ValidateSet('info','warn','debug')]
-    [string]$LogLevel = 'info',
-    [string]$LogFile = '',
-    [switch]$Help
-)
+.EXAMPLE
+    .\restore.ps1 --non-interactive
+    Restore without prompts (for automation)
+#>
 
 # Emergency logging setup (before any other operations)
 $script:EmergencyLogFile = Join-Path (Split-Path -Parent $PSCommandPath) "restore-emergency-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
@@ -148,6 +155,7 @@ function Show-Help {
     Write-Host "  .\restore.ps1 --select-containers web,db                # Restore specific containers"
     Write-Host "  .\restore.ps1 --name-suffix -test --port-strategy auto-remap  # Test restore with remapping"
     Write-Host "  .\restore.ps1 --bind-root C:\NewLocation --dry-run      # Preview with custom bind location"
+    Write-Host "  .\restore.ps1 --non-interactive                         # Restore without prompts (automation)"
     exit 0
 }
 
@@ -610,41 +618,103 @@ function Restore-Volumes {
                     }
                 }
                 
-                # Extract volume contents using temporary container
-                $tempContainer = "restore-helper-$(Get-Random)"
-                $tempDir = Join-Path $env:TEMP "docker-restore-$(Get-Random)"
-                New-Item -Path $tempDir -ItemType Directory -Force | Out-Null
+                # Get archive size for logging
+                $archiveSize = [math]::Round($volumeFile.Length / 1MB, 2)
+                Write-Log "Archive file: $($volumeFile.FullName) (${archiveSize}MB)" -Level debug
                 
-                # Extract archive to temp directory based on file type
                 if ($volumeFile.Extension -eq '.gz') {
-                    # Handle .tar.gz files
-                    $tarArgs = @('run', '--rm', '-v', "${tempDir}:/extract", '-v', "$($volumeFile.FullName):/archive.tar.gz", 'busybox', 'tar', '-xzf', '/archive.tar.gz', '-C', '/extract')
-                    $process = Start-Process -FilePath 'docker' -ArgumentList $tarArgs -Wait -PassThru -NoNewWindow
-                    if ($process.ExitCode -ne 0) {
-                        throw "Failed to extract tar.gz archive"
+                    # Handle .tar.gz files: copy archive into volume, then extract it
+                    # This avoids Windows path mounting issues by using docker cp
+                    Write-Log "Restoring tar.gz archive using docker cp into volume..." -Level debug
+                    
+                    $tempContainer = "restore-helper-$(Get-Random)"
+                    
+                    try {
+                        # Create and run a temporary container with the volume mounted
+                        Write-Log "Creating temporary container with volume mounted..." -Level debug
+                        $runArgs = @('run', '--name', $tempContainer, '-v', "${volumeName}:/volume", 'busybox', 'true')
+                        $runProcess = Start-Process -FilePath 'docker' -ArgumentList $runArgs -Wait -PassThru -NoNewWindow
+                        
+                        if ($runProcess.ExitCode -ne 0) {
+                            throw "Failed to create temporary container"
+                        }
+                        
+                        # Copy archive from Windows directly into the mounted volume (not /tmp)
+                        # This way the file is accessible when we mount the same volume in another container
+                        Write-Log "Copying archive from Windows into volume..." -Level debug
+                        $copyArgs = @('cp', $volumeFile.FullName, "${tempContainer}:/volume/restore.tar.gz")
+                        Write-Log "Docker cp command: docker $($copyArgs -join ' ')" -Level debug
+                        $copyProcess = Start-Process -FilePath 'docker' -ArgumentList $copyArgs -Wait -PassThru -NoNewWindow -RedirectStandardError "$env:TEMP\docker_cp_err.log"
+                        
+                        if ($copyProcess.ExitCode -ne 0) {
+                            $copyError = Get-Content "$env:TEMP\docker_cp_err.log" -Raw -ErrorAction SilentlyContinue
+                            throw "Failed to copy archive to volume: $copyError"
+                        }
+                        
+                        Write-Log "Archive copied successfully, verifying..." -Level debug
+                        
+                        # Extract archive by mounting the same volume
+                        Write-Log "Extracting archive inside volume..." -Level debug
+                        $extractArgs = @('run', '--rm', '-v', "${volumeName}:/volume", 'busybox', 'sh', '-c', 'cd /volume && tar -xzf restore.tar.gz && rm restore.tar.gz')
+                        Write-Log "Docker extract command: docker $($extractArgs -join ' ')" -Level debug
+                        $extractProcess = Start-Process -FilePath 'docker' -ArgumentList $extractArgs -Wait -PassThru -NoNewWindow -RedirectStandardOutput "$env:TEMP\tar_extract.log" -RedirectStandardError "$env:TEMP\tar_extract_err.log"
+                        
+                        if ($extractProcess.ExitCode -ne 0) {
+                            $extractError = Get-Content "$env:TEMP\tar_extract_err.log" -Raw -ErrorAction SilentlyContinue
+                            $extractOutput = Get-Content "$env:TEMP\tar_extract.log" -Raw -ErrorAction SilentlyContinue
+                            Write-Log "Archive extraction failed. Error: $extractError" -Level error
+                            Write-Log "Archive extraction output: $extractOutput" -Level debug
+                            throw "Failed to extract tar.gz archive: $extractError"
+                        }
+                        
+                        $extractOutput = Get-Content "$env:TEMP\tar_extract.log" -Raw -ErrorAction SilentlyContinue
+                        if ($extractOutput) {
+                            Write-Log "Extraction output: $extractOutput" -Level debug
+                        }
+                        
+                        Write-Log "Archive extracted successfully to volume: $volumeName" -Level debug
                     }
+                    finally {
+                        # Clean up temporary container
+                        Write-Log "Cleaning up temporary container..." -Level debug
+                        docker rm $tempContainer 2>&1 | Out-Null
+                    }
+                    
                 } else {
-                    # Handle .zip files
-                    Expand-Archive -Path $volumeFile.FullName -DestinationPath $tempDir -Force
+                    # Handle .zip files - extract to temp directory first, then copy to volume
+                    Write-Log "Extracting zip archive to volume..." -Level debug
+                    
+                    $tempDir = Join-Path $env:TEMP "docker-restore-$(Get-Random)"
+                    New-Item -Path $tempDir -ItemType Directory -Force | Out-Null
+                    
+                    try {
+                        # Extract zip file
+                        Expand-Archive -Path $volumeFile.FullName -DestinationPath $tempDir -Force
+                        
+                        # Copy contents to volume using container
+                        $copyArgs = @(
+                            'run', '--rm',
+                            '-v', "${volumeName}:/volume",
+                            '-v', "${tempDir}:/source:ro",
+                            'busybox', 'sh', '-c', 'cp -r /source/* /volume/ 2>/dev/null || cp -r /source/. /volume/'
+                        )
+                        
+                        $process = Start-Process -FilePath 'docker' -ArgumentList $copyArgs -Wait -PassThru -NoNewWindow
+                        if ($process.ExitCode -ne 0) {
+                            throw "Failed to copy extracted files to volume"
+                        }
+                        
+                        Write-Log "Archive extracted successfully to volume: $volumeName" -Level debug
+                    }
+                    finally {
+                        # Clean up temp directory
+                        if (Test-Path $tempDir) {
+                            Remove-Item $tempDir -Recurse -Force -ErrorAction SilentlyContinue
+                        }
+                    }
                 }
                 
-                # Copy contents to volume using container
-                $copyArgs = @(
-                    'run', '--rm', '--name', $tempContainer,
-                    '-v', "${volumeName}:/volume",
-                    '-v', "${tempDir}:/source",
-                    'busybox', 'sh', '-c', 'cp -r /source/* /volume/ 2>/dev/null || true'
-                )
-                
-                $process = Start-Process -FilePath 'docker' -ArgumentList $copyArgs -Wait -PassThru -NoNewWindow
-                if ($process.ExitCode -ne 0) {
-                    Write-Log "Warning: Some files may not have been copied to volume $volumeName" -Level warn
-                }
-                
-                # Clean up temp directory
-                Remove-Item $tempDir -Recurse -Force
-                
-                Write-Log "Restored volume: $volumeName" -Level debug
+                Write-Log "Successfully restored volume: $volumeName" -Level info
             }
             catch {
                 Write-Log ("Failed to restore volume " + $volumeName + ": " + $_) -Level error
@@ -822,15 +892,24 @@ function Restore-Containers {
                 if ($container.ports) {
                     foreach ($port in $container.ports) {
                         try {
+                            # Debug: Log port configuration for troubleshooting
+                            Write-Log "Processing port: host_port=$($port.host_port), container_port=$($port.container_port), host_ip=$($port.host_ip)" -Level debug
+                            
+                            # Validate port values and fail if invalid (don't skip)
+                            if (-not $port.host_port -or -not $port.container_port) {
+                                throw "Invalid port mapping in backup data: host_port=$($port.host_port), container_port=$($port.container_port). Backup may be corrupted."
+                            }
+                            
                             $hostPort = Get-AvailablePort -PreferredPort ([int]$port.host_port)
-                            $portMapping = "${hostPort}:$($port.container_port)"
+                            $containerPort = $port.container_port
+                            $portMapping = "${hostPort}:${containerPort}"
                             if ($port.host_ip -and $port.host_ip -ne '0.0.0.0') {
-                                $portMapping = "$($port.host_ip):$portMapping"
+                                $portMapping = "${port.host_ip}:$portMapping"
                             }
                             $runArgs += @('-p', $portMapping)
                             
                             if ($hostPort -ne [int]$port.host_port) {
-                                $script:PortMappings["$($container.name):$($port.container_port)"] = $hostPort
+                                $script:PortMappings["${container.name}:${port.container_port}"] = $hostPort
                             }
                         }
                         catch {
@@ -846,8 +925,17 @@ function Restore-Containers {
                 if ($container.volumes) {
                     foreach ($volume in $container.volumes) {
                         if ($volume.type -eq 'volume') {
+                            # Debug: Log volume configuration for troubleshooting
+                            Write-Log "Processing volume: name=$($volume.name), destination=$($volume.destination), type=$($volume.type)" -Level debug
+                            
+                            # Validate volume values and fail if invalid (don't skip)
+                            if (-not $volume.name -or -not $volume.destination) {
+                                throw "Invalid volume mount in backup data: name=$($volume.name), destination=$($volume.destination). Backup may be corrupted."
+                            }
+                            
                             $volumeName = $volume.name + $NameSuffix
-                            $volumeMount = "${volumeName}:$($volume.destination)"
+                            $volumeDestination = $volume.destination
+                            $volumeMount = "${volumeName}:${volumeDestination}"
                             if ($volume.read_only) {
                                 $volumeMount += ':ro'
                             }
@@ -860,7 +948,7 @@ function Restore-Containers {
                                 $sourcePath = Join-Path $BindRoot $relativePath
                             }
                             
-                            $bindMount = "${sourcePath}:$($volume.destination)"
+                            $bindMount = "${sourcePath}:${volume.destination}"
                             if ($volume.read_only) {
                                 $bindMount += ':ro'
                             }
@@ -888,11 +976,6 @@ function Restore-Containers {
                     $runArgs += '--privileged'
                 }
                 
-                # Add entrypoint BEFORE image (Docker flag order matters!)
-                if ($container.entrypoint) {
-                    $runArgs += @('--entrypoint', ($container.entrypoint -join ' '))
-                }
-                
                 # Add image (check for snapshot first)
                 $imageToUse = $container.image
                 
@@ -906,11 +989,35 @@ function Restore-Containers {
                     Write-Log "Using original image for container: $($container.name) -> $imageToUse" -Level debug
                 }
                 
+                # Handle entrypoint: --entrypoint only accepts ONE value (the executable)
+                # Any additional entrypoint args must be part of the command
+                $entrypointExec = $null
+                $entrypointArgs = @()
+                
+                if ($container.entrypoint -and $container.entrypoint.Count -gt 0) {
+                    $entrypointExec = $container.entrypoint[0]
+                    if ($container.entrypoint.Count -gt 1) {
+                        $entrypointArgs = $container.entrypoint[1..($container.entrypoint.Count - 1)]
+                    }
+                }
+                
+                # Add entrypoint if present (only the executable, not args)
+                if ($entrypointExec) {
+                    $runArgs += @('--entrypoint', $entrypointExec)
+                }
+                
                 $runArgs += $imageToUse
                 
-                # Add command AFTER image (these are container arguments)
+                # Add command AFTER image (combine entrypoint args + original command)
+                $fullCommand = @()
+                if ($entrypointArgs.Count -gt 0) {
+                    $fullCommand += $entrypointArgs
+                }
                 if ($container.command) {
-                    $runArgs += $container.command
+                    $fullCommand += $container.command
+                }
+                if ($fullCommand.Count -gt 0) {
+                    $runArgs += $fullCommand
                 }
                 
                 # Execute docker run
@@ -934,6 +1041,43 @@ function Restore-Containers {
     }
     
     return $success
+}
+
+function Start-RestoredContainers {
+    if ($script:RestoredContainers.Count -eq 0) {
+        return
+    }
+    
+    Write-Host ""
+    Write-Host "=== CONTAINER STARTUP ===" -ForegroundColor Cyan
+    Write-Host "Restored containers:"
+    foreach ($container in $script:RestoredContainers) {
+        Write-Host "  - $container" -ForegroundColor Gray
+    }
+    
+    if ($NonInteractive) {
+        Write-Host "Non-interactive mode - containers left stopped" -ForegroundColor Yellow
+        return
+    }
+    
+    Write-Host ""
+    $response = Read-Host "Start all restored containers now? (y/n)"
+    
+    if ($response -eq 'y' -or $response -eq 'yes') {
+        Write-Host "Starting containers..." -ForegroundColor Green
+        foreach ($containerName in $script:RestoredContainers) {
+            Write-Host "Starting $containerName..." -NoNewline
+            try {
+                docker start $containerName | Out-Null
+                Write-Host " OK" -ForegroundColor Green
+            }
+            catch {
+                Write-Host " FAILED" -ForegroundColor Red
+            }
+        }
+    } else {
+        Write-Host "Containers left stopped" -ForegroundColor Gray
+    }
 }
 
 function Show-Summary {
@@ -1019,11 +1163,11 @@ function Main {
     
     if (-not (Verify-BackupIntegrity $BackupRoot)) {
         if (-not $Force) {
-            Write-Log "Backup integrity check failed. Use --force to proceed anyway." -Level error
+            Write-Log 'Backup integrity check failed. Use --force to proceed anyway.' -Level error
             exit 1
         }
         else {
-            Write-Log "Proceeding despite integrity check failures (--force specified)" -Level warn
+            Write-Log 'Proceeding despite integrity check failures (--force specified)' -Level warn
         }
     }
     
@@ -1076,30 +1220,40 @@ function Main {
         $success = $false
     }
     
+    # Ask user if they want to start the restored containers
+    if ($script:RestoredContainers.Count -gt 0 -and -not $DryRun) {
+        Start-RestoredContainers
+    }
+    
     # Show summary
     Show-Summary
     
     if ($success) {
         Write-Log "Restore completed successfully" -Level info
+        if (-not $NonInteractive) {
+            Write-Host ""
+            Read-Host "Press Enter to exit"
+        }
         exit 0
     }
     else {
         Write-Log "Restore completed with errors" -Level error
+        if (-not $NonInteractive) {
+            Write-Host ""
+            Read-Host "Press Enter to exit"
+        }
         exit 1
     }
 }
 
 # Execute main function with emergency error handling
 try {
-    try { "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] About to call Main function" | Add-Content -Path $script:EmergencyLogFile } catch { }
     Main
-    try { "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Main function completed successfully" | Add-Content -Path $script:EmergencyLogFile } catch { }
 }
 catch {
-    try { "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] CRITICAL ERROR in Main: $($_.Exception.Message)" | Add-Content -Path $script:EmergencyLogFile } catch { }
-    try { "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] Stack trace: $($_.ScriptStackTrace)" | Add-Content -Path $script:EmergencyLogFile } catch { }
     Write-Host "CRITICAL ERROR: $($_.Exception.Message)" -ForegroundColor Red
-    Write-Host "Emergency log saved to: $script:EmergencyLogFile" -ForegroundColor Yellow
-    Read-Host "Press Enter to exit"
+    if (-not $NonInteractive) {
+        Read-Host "Press Enter to exit"
+    }
     exit 1
 }

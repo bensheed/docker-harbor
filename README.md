@@ -45,13 +45,13 @@ A PowerShell-based tool for comprehensive Docker environment backup and restorat
 ### Backup with Specific Options
 ```powershell
 # Backup only images and volumes
-.\backup.ps1 --include images,volumes
+.\backup.ps1 -Include images,volumes
 
 # Encrypted backup
-.\backup.ps1 --encrypt zip-aes256 --passphrase "your-secret"
+.\backup.ps1 -Encrypt zip-aes256 -Passphrase "your-secret"
 
 # Preview what would be backed up
-.\backup.ps1 --dry-run
+.\backup.ps1 -DryRun
 ```
 
 ### Restore from Backup
@@ -60,10 +60,10 @@ A PowerShell-based tool for comprehensive Docker environment backup and restorat
 .\restore.ps1
 
 # Restore specific backup with name suffix
-.\restore.ps1 --backup-root "C:\backups\20241015-143022" --name-suffix "-restored"
+.\restore.ps1 -BackupRoot "C:\backups\20241015-143022" -NameSuffix "-restored"
 
 # Restore only specific containers
-.\restore.ps1 --select-containers "web,database"
+.\restore.ps1 -SelectContainers "web,database"
 ```
 
 ## Container Storage Scenarios
@@ -103,22 +103,22 @@ docker-backup/
 
 ### Environment Testing
 ```powershell
-.\backup.ps1 --test-environment
+.\backup.ps1 -TestEnvironment
 ```
 
 ### Custom Output Location
 ```powershell
-.\backup.ps1 --output-root "E:\docker-backups"
+.\backup.ps1 -OutputRoot "E:\docker-backups"
 ```
 
 ### Exclude Components
 ```powershell
-.\backup.ps1 --exclude binds,networks
+.\backup.ps1 -Exclude binds,networks
 ```
 
 ### Restore with Port Remapping
 ```powershell
-.\restore.ps1 --port-strategy auto-remap
+.\restore.ps1 -PortStrategy auto-remap
 ```
 
 ## Use Cases

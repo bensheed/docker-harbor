@@ -1,5 +1,23 @@
 #Requires -Version 5.1
 
+[CmdletBinding()]
+param(
+    [string[]]$Include = @('images','configs','volumes','binds','networks','compose'),
+    [string[]]$Exclude = @(),
+    [ValidateSet('none','zip')]
+    [string]$Compress = 'zip',
+    [int]$SplitSize = 0,
+    [ValidateSet('off','zip-aes256')]
+    [string]$Encrypt = 'off',
+    [string]$Passphrase = '',
+    [string]$OutputRoot = '',
+    [string]$LogLevel = 'debug',  # Default to maximum detail
+    [string]$LogFile = '',
+    [switch]$DryRun,
+    [switch]$Help,
+    [switch]$TestEnvironment
+)
+
 # Handle execution policy with UAC elevation if needed
 if ((Get-ExecutionPolicy) -eq 'Restricted') {
     # Check if already running as administrator
@@ -93,24 +111,6 @@ if ((Get-ExecutionPolicy) -eq 'Restricted') {
     .\backup.ps1 --output-root D:\backups
     Backup to custom location with interactive container selection
 #>
-
-[CmdletBinding()]
-param(
-    [string[]]$Include = @('images','configs','volumes','binds','networks','compose'),
-    [string[]]$Exclude = @(),
-    [ValidateSet('none','zip')]
-    [string]$Compress = 'zip',
-    [int]$SplitSize = 0,
-    [ValidateSet('off','zip-aes256')]
-    [string]$Encrypt = 'off',
-    [string]$Passphrase = '',
-    [string]$OutputRoot = '',
-    [string]$LogLevel = 'debug',  # Default to maximum detail
-    [string]$LogFile = '',
-    [switch]$DryRun,
-    [switch]$Help,
-    [switch]$TestEnvironment
-)
 
 # IMMEDIATE ERROR LOGGING - Start logging before anything else
 $script:EmergencyLogFile = Join-Path (Split-Path -Parent $PSCommandPath) "backup-emergency-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
@@ -680,7 +680,7 @@ function Export-ContainerSnapshot {
         $containerName = $ContainerDetails.Name -replace '^/', ''
         $imageName = "$containerName-snapshot"
         $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
-        $snapshotTag = "$imageName:$timestamp"
+        $snapshotTag = "${imageName}:${timestamp}"
         
         Write-Log "Creating filesystem snapshot for container: $containerName" -Level info
         Write-Log "This captures all data stored inside the container filesystem" -Level info
@@ -931,27 +931,91 @@ function Export-Volume {
     
     if (-not $DryRun) {
         try {
+            # First, check if the volume actually exists and has content
+            Write-Log "Checking if volume exists: $VolumeName" -Level debug
+            $volumeInspect = docker volume inspect $VolumeName 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                throw "Volume does not exist: $VolumeName. Error: $volumeInspect"
+            }
+            Write-Log "Volume exists, checking contents..." -Level debug
+            
+            # Check volume contents first
+            $contentCheck = docker run --rm -v "${VolumeName}:/volume:ro" busybox ls -la /volume 2>&1
+            Write-Log "Volume contents: $contentCheck" -Level debug
+            
+            # Check if volume is empty (simplified approach)
+            $fileCount = docker run --rm -v "${VolumeName}:/volume:ro" busybox find /volume -mindepth 1 -maxdepth 1 | Measure-Object | Select-Object -ExpandProperty Count
+            $isEmpty = if ($fileCount -eq 0) { "empty" } else { "not-empty" }
+            Write-Log "Volume file count: $fileCount" -Level debug
+            Write-Log "Volume empty check result: $isEmpty" -Level debug
+            
             # Use a temporary container to tar the volume contents
             $tempContainer = "backup-helper-$(Get-Random)"
             
+            # Test if Docker can access the backup directory
+            $volumesPath = "${script:BackupRoot}\volumes"
+            Write-Log "Testing Docker access to backup directory: $volumesPath" -Level debug
+            
+            $testCmd = "docker run --rm -v `"${volumesPath}:/test`" busybox ls -la /test"
+            $testOutput = cmd /c "$testCmd 2>&1"
+            $testExitCode = $LASTEXITCODE
+            Write-Log "Directory access test exit code: $testExitCode" -Level debug
+            Write-Log "Directory access test output: $testOutput" -Level debug
+            
             # Create tar archive of volume
-            $tarArgs = @(
-                'run', '--rm', '--name', $tempContainer,
-                '-v', "${VolumeName}:/volume:ro",
-                '-v', "${script:BackupRoot}\volumes:/backup",
-                'busybox', 'tar', 'czf', "/backup/$VolumeName.tar.gz", '-C', '/volume', '.'
-            )
+            # Force use of container copy approach due to Docker Desktop Windows path mapping issues
+            Write-Log "Using container copy approach to avoid Windows path mapping issues" -Level debug
+            if ($true) {
+                Write-Log "Creating tar in temporary container, then copying to host" -Level debug
+                
+                # Create tar inside a temporary container and copy it out
+                if ($isEmpty -eq "empty") {
+                    Write-Log "Volume is empty, creating empty archive in container" -Level debug
+                    $tarArgs = @(
+                        'run', '--name', $tempContainer,
+                        'busybox', 'tar', 'czf', "/tmp/$VolumeName.tar.gz", '--files-from', '/dev/null'
+                    )
+                } else {
+                    Write-Log "Volume has content, creating archive in container" -Level debug
+                    $tarArgs = @(
+                        'run', '--name', $tempContainer,
+                        '-v', "${VolumeName}:/volume:ro",
+                        'busybox', 'tar', 'czf', "/tmp/$VolumeName.tar.gz", '-C', '/volume', '.'
+                    )
+                }
+                
+                Write-Log "Creating archive in temporary container..." -Level debug
+                $dockerCmd = "docker $($tarArgs -join ' ')"
+                $output = cmd /c "$dockerCmd 2>&1"
+                $exitCode = $LASTEXITCODE
+                
+                if ($exitCode -eq 0) {
+                    Write-Log "Copying archive from container to host..." -Level debug
+                    $copyCmd = "docker cp ${tempContainer}:/tmp/$VolumeName.tar.gz `"$volumesPath\$VolumeName.tar.gz`""
+                    $copyOutput = cmd /c "$copyCmd 2>&1"
+                    $copyExitCode = $LASTEXITCODE
+                    Write-Log "Copy command: $copyCmd" -Level debug
+                    Write-Log "Copy output: $copyOutput" -Level debug
+                    Write-Log "Copy exit code: $copyExitCode" -Level debug
+                    
+                    # Clean up temporary container
+                    docker rm $tempContainer 2>&1 | Out-Null
+                    
+                    if ($copyExitCode -ne 0) {
+                        throw "Failed to copy archive from container: $copyOutput"
+                    }
+                } else {
+                    docker rm $tempContainer 2>&1 | Out-Null
+                    throw "Failed to create archive in container: $output"
+                }
+            }
             
-            Write-Log "Running Docker command: docker $($tarArgs -join ' ')" -Level debug
             Write-Log "Volume name for file path: '$VolumeName'" -Level debug
+            Write-Log "Backup directory: ${script:BackupRoot}\volumes" -Level debug
             
-            # Use direct docker command instead of Start-Process to avoid hanging
-            $dockerCmd = "docker $($tarArgs -join ' ')"
-            $output = cmd /c "$dockerCmd 2>&1"
-            $exitCode = $LASTEXITCODE
-            
-            Write-Log "Docker command output: $output" -Level debug
-            Write-Log "Docker command exit code: $exitCode" -Level debug
+            # Set success exit code for container copy approach
+            $exitCode = 0
+            Write-Log "Container copy approach completed successfully" -Level debug
             if ($exitCode -ne 0) {
                 throw "Volume backup failed with exit code $exitCode. Output: $output"
             }
@@ -959,16 +1023,30 @@ function Export-Volume {
             $tarFile = "$script:BackupRoot\volumes\$VolumeName.tar.gz"
             Write-Log "Expected tar file path: '$tarFile'" -Level debug
             
+            # Wait a moment for file system to sync
+            Start-Sleep -Seconds 2
+            
             # Verify the file was actually created and has content
             if (-not (Test-Path $tarFile)) {
                 # List what files were actually created in the volumes directory
                 $volumesDir = "$script:BackupRoot\volumes"
+                Write-Log "Checking volumes directory: $volumesDir" -Level debug
                 if (Test-Path $volumesDir) {
                     $actualFiles = Get-ChildItem -Path $volumesDir -File | Select-Object -ExpandProperty Name
                     Write-Log "Files actually created in volumes directory: $($actualFiles -join ', ')" -Level debug
+                    
+                    # Also check for any files with similar names
+                    $allFiles = Get-ChildItem -Path $volumesDir -File | ForEach-Object { "$($_.Name) (Size: $($_.Length) bytes)" }
+                    Write-Log "All files in volumes directory: $($allFiles -join ', ')" -Level debug
                 } else {
                     Write-Log "Volumes directory does not exist: $volumesDir" -Level debug
                 }
+                
+                # Check if Docker Desktop is using a different path mapping
+                Write-Log "Checking if this is a Docker Desktop path mapping issue..." -Level debug
+                $dockerInfo = docker info 2>&1 | Select-String "Operating System"
+                Write-Log "Docker info: $dockerInfo" -Level debug
+                
                 throw "Volume backup file was not created: $tarFile"
             }
             if ((Get-Item $tarFile).Length -eq 0) {
@@ -1086,24 +1164,46 @@ function Export-Networks {
     }
     
     try {
-        $networksJson = docker network ls --format json 2>$null
-        if ($LASTEXITCODE -ne 0) {
-            throw "Failed to list networks"
+        # Collect networks used by selected containers
+        $usedNetworks = @()
+        foreach ($container in $script:Manifest.containers) {
+            if ($container.networks) {
+                foreach ($network in $container.networks) {
+                    if ($network.name -notin @('bridge', 'host', 'none') -and $network.name -notin $usedNetworks) {
+                        $usedNetworks += $network.name
+                        Write-Log "Found network used by container $($container.name): $($network.name)" -Level debug
+                    }
+                }
+            }
         }
         
+        Write-Log "Networks used by selected containers: $($usedNetworks -join ', ')" -Level debug
+        
         $networks = @()
-        $networksJson -split "`n" | Where-Object { $_.Trim() } | ForEach-Object {
-            $network = ConvertFrom-Json $_
-            if ($network.Name -notin @('bridge', 'host', 'none')) {
-                $networkDetails = docker network inspect $network.Name | ConvertFrom-Json
-                $networks += $networkDetails[0]
+        if ($usedNetworks.Count -gt 0) {
+            foreach ($networkName in $usedNetworks) {
+                try {
+                    $networkDetails = docker network inspect $networkName | ConvertFrom-Json
+                    $networks += $networkDetails[0]
+                    Write-Log "Exported network details: $networkName" -Level debug
+                }
+                catch {
+                    Write-Log "Warning: Could not inspect network $networkName - it may have been removed" -Level warn
+                }
             }
+        } else {
+            Write-Log "No custom networks used by selected containers" -Level debug
         }
         
         $networksFile = "$script:BackupRoot\networks.json"
         
         if (-not $DryRun) {
-            $networks | ConvertTo-Json -Depth 10 | Set-Content -Path $networksFile -Encoding UTF8
+            # Ensure we always create valid JSON, even for empty arrays
+            if ($networks.Count -eq 0) {
+                "[]" | Set-Content -Path $networksFile -Encoding UTF8
+            } else {
+                $networks | ConvertTo-Json -Depth 10 | Set-Content -Path $networksFile -Encoding UTF8
+            }
             $checksum = Get-FileHash -Path $networksFile -Algorithm SHA256
             $script:Manifest.checksums["networks.json"] = $checksum.Hash
         }
@@ -1155,7 +1255,7 @@ function Generate-DockerCompose {
         if ($container.ports) {
             $service.ports = @()
             foreach ($port in $container.ports) {
-                $service.ports += "$($port.host_port):$($port.container_port)"
+                $service.ports += "${port.host_port}:${port.container_port}"
             }
         }
         
@@ -1163,11 +1263,11 @@ function Generate-DockerCompose {
             $service.volumes = @()
             foreach ($volume in $container.volumes) {
                 if ($volume.type -eq 'volume') {
-                    $service.volumes += "$($volume.name):$($volume.destination)"
+                    $service.volumes += "${volume.name}:${volume.destination}"
                     $compose.volumes[$volume.name] = @{}
                 }
                 elseif ($volume.type -eq 'bind') {
-                    $service.volumes += "$($volume.source):$($volume.destination)"
+                    $service.volumes += "${volume.source}:${volume.destination}"
                 }
             }
         }
