@@ -94,7 +94,75 @@
 - **Network export bug**: Fixed in commits `e0d3527` and `cc8b4c8`
 - **Empty networks.json**: Fixed in same commits
 
+## Resolution (2025-10-16)
+
+### Root Cause Identified - Volume Extraction
+
+**Problem 1**: `--volumes-from` only shares volume mounts, not container filesystem  
+The script was trying to use `--volumes-from` to access files in `/tmp` of a stopped container. This doesn't work because `--volumes-from` only shares mounted volumes, not the container's internal filesystem layers.
+
+**Problem 2**: Windows path mounting causes "tar: invalid magic" errors  
+Attempting to mount Windows directories directly (e.g., `-v "D:\path":/backup`) causes tar to fail with "invalid magic" errors, even though the mount appears to work.
+
+### Solution Implemented - Copy into Volume
+
+Instead of mounting Windows paths, we copy the archive directly into the Docker volume itself, then extract it:
+
+```powershell
+# 1. Create a container with the volume mounted
+docker run --name temp-container -v volumeName:/volume busybox true
+
+# 2. Copy archive from Windows into the volume (not /tmp!)
+docker cp archive.tar.gz temp-container:/volume/restore.tar.gz
+
+# 3. Extract from within the volume in a new container
+docker run --rm -v volumeName:/volume busybox sh -c 'cd /volume && tar -xzf restore.tar.gz && rm restore.tar.gz'
+
+# 4. Clean up temp container
+docker rm temp-container
+```
+
+This approach:
+- ✅ Uses `docker cp` which handles Windows paths correctly
+- ✅ Avoids mounting Windows directories into Linux containers
+- ✅ Places the archive IN the volume where it's accessible
+- ✅ Works reliably on Windows Docker Desktop
+- ✅ No path translation issues
+
+### Root Cause Identified - Container Creation
+
+**Problem 3**: PowerShell string interpolation with object properties  
+When building Docker commands with `"${object.property}"` syntax, PowerShell doesn't interpolate correctly in array contexts, resulting in empty strings in the command.
+
+**Symptoms**: 
+- Docker command shows `-p 5678:` instead of `-p 5678:5678`
+- Docker command shows `-v volume:` instead of `-v volume:/path`
+- Container creation fails with exit code 125
+
+**Solution**: Assign properties to variables first before string interpolation:
+```powershell
+# BROKEN:
+$portMapping = "${hostPort}:${port.container_port}"
+
+# FIXED:
+$containerPort = $port.container_port
+$portMapping = "${hostPort}:${containerPort}"
+```
+
+### Key Insights
+
+1. **`--volumes-from` limitation**: Only shares volumes, not container filesystem (`/tmp`, `/etc`, etc.)
+2. **Windows mounting issue**: Mounting Windows directories into Linux containers has path translation problems
+3. **docker cp reliability**: `docker cp` works reliably for Windows→Container file transfers
+4. **Volume as staging area**: The volume itself can serve as a temporary staging area for the archive
+5. **PowerShell interpolation**: Object property access in string interpolation needs explicit variables
+
+### Reference
+- Docker cp documentation: https://docs.docker.com/reference/cli/docker/container/cp/
+- Related GitHub issue #4: PowerShell string interpolation bug
+- Logs: `restore-20251016-144846.log` (volume extraction SUCCESS)
+
 ## File References
-- **Latest failing log**: `restore-20251016-121518.log`
-- **Successful backup log**: `backup-20251015-171154.log`
-- **Test volume**: `n8n_data.tar.gz` (561.36MB)
+- **Volume extraction working**: `restore-20251016-144846.log`
+- **Container creation issue**: Same log, line 54
+- **Test volume**: `n8n_data.tar.gz` (561.36MB) - EXTRACTED SUCCESSFULLY

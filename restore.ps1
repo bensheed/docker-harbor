@@ -618,196 +618,103 @@ function Restore-Volumes {
                     }
                 }
                 
-                # Extract volume contents using temporary container
-                $tempContainer = "restore-helper-$(Get-Random)"
-                $tempDir = Join-Path $env:TEMP "docker-restore-$(Get-Random)"
-                New-Item -Path $tempDir -ItemType Directory -Force | Out-Null
+                # Get archive size for logging
+                $archiveSize = [math]::Round($volumeFile.Length / 1MB, 2)
+                Write-Log "Archive file: $($volumeFile.FullName) (${archiveSize}MB)" -Level debug
                 
-                # Extract archive using Docker cp approach (avoids Windows path mapping issues)
                 if ($volumeFile.Extension -eq '.gz') {
-                    # Handle .tar.gz files using container copy approach
-                    $extractContainer = "extract-helper-$(Get-Random)"
+                    # Handle .tar.gz files: copy archive into volume, then extract it
+                    # This avoids Windows path mounting issues by using docker cp
+                    Write-Log "Restoring tar.gz archive using docker cp into volume..." -Level debug
                     
-                    # Create container with the archive
-                    $createArgs = @('create', '--name', $extractContainer, 'busybox', 'sh')
-                    $process = Start-Process -FilePath 'docker' -ArgumentList $createArgs -Wait -PassThru -NoNewWindow
-                    if ($process.ExitCode -ne 0) {
-                        throw "Failed to create extraction container"
-                    }
-                    
-                    # Verify archive file exists and get size
-                    $archiveSize = [math]::Round($volumeFile.Length / 1MB, 2)
-                    Write-Log "Archive file: $($volumeFile.FullName) (${archiveSize}MB)" -Level debug
-                    
-                    # Copy archive into container using volume-based approach for Windows reliability
-                    Write-Log "Copying archive to extraction container..." -Level debug
-                    
-                    # Use volume-based transfer method as primary approach for Windows Docker cp issues
-                    $copySuccess = $false
-                    
-                    # Create a temporary volume for file transfer
-                    $tempVolume = "temp-transfer-$(Get-Random)"
-                    Write-Log "Creating temporary volume for file transfer: $tempVolume" -Level debug
-                    docker volume create $tempVolume 2>&1 | Out-Null
+                    $tempContainer = "restore-helper-$(Get-Random)"
                     
                     try {
-                        # Copy to simple temporary path first to avoid Windows filesystem issues
-                        $tempDir = "$env:TEMP\docker-restore"
-                        $tempFilePath = "$tempDir\archive.tar.gz"
+                        # Create and run a temporary container with the volume mounted
+                        Write-Log "Creating temporary container with volume mounted..." -Level debug
+                        $runArgs = @('run', '--name', $tempContainer, '-v', "${volumeName}:/volume", 'busybox', 'true')
+                        $runProcess = Start-Process -FilePath 'docker' -ArgumentList $runArgs -Wait -PassThru -NoNewWindow
                         
-                        # Ensure temp directory exists
-                        if (-not (Test-Path $tempDir)) {
-                            New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
-                            Write-Log "Created temporary directory: $tempDir" -Level debug
+                        if ($runProcess.ExitCode -ne 0) {
+                            throw "Failed to create temporary container"
                         }
                         
-                        # Copy archive to simple temp path
-                        Write-Log "Copying archive to temporary location to avoid Windows path issues..." -Level debug
-                        Write-Log "Source: $($volumeFile.FullName)" -Level debug
-                        Write-Log "Temp location: $tempFilePath" -Level debug
+                        # Copy archive from Windows directly into the mounted volume (not /tmp)
+                        # This way the file is accessible when we mount the same volume in another container
+                        Write-Log "Copying archive from Windows into volume..." -Level debug
+                        $copyArgs = @('cp', $volumeFile.FullName, "${tempContainer}:/volume/restore.tar.gz")
+                        Write-Log "Docker cp command: docker $($copyArgs -join ' ')" -Level debug
+                        $copyProcess = Start-Process -FilePath 'docker' -ArgumentList $copyArgs -Wait -PassThru -NoNewWindow -RedirectStandardError "$env:TEMP\docker_cp_err.log"
                         
-                        Copy-Item -Path $volumeFile.FullName -Destination $tempFilePath -Force
-                        
-                        # Verify temp file was created successfully
-                        if (-not (Test-Path $tempFilePath)) {
-                            throw "Failed to copy archive to temporary location"
+                        if ($copyProcess.ExitCode -ne 0) {
+                            $copyError = Get-Content "$env:TEMP\docker_cp_err.log" -Raw -ErrorAction SilentlyContinue
+                            throw "Failed to copy archive to volume: $copyError"
                         }
                         
-                        $tempFileSize = [math]::Round((Get-Item $tempFilePath).Length / 1MB, 2)
-                        Write-Log "Temporary file created successfully: ${tempFileSize}MB" -Level debug
+                        Write-Log "Archive copied successfully, verifying..." -Level debug
                         
-                        # Copy file to temporary volume using simple temp path
-                        Write-Log "Copying archive from temp location to temporary volume..." -Level debug
-                        $tempCopyArgs = @('run', '--rm', '-v', "${tempVolume}:/transfer", '-v', "`"${tempFilePath}`":/source/archive.tar.gz:ro", 'busybox', 'cp', '/source/archive.tar.gz', '/transfer/archive.tar.gz')
-                        Write-Log "Temp copy command: docker $($tempCopyArgs -join ' ')" -Level debug
-                        $tempCopyProcess = Start-Process -FilePath 'docker' -ArgumentList $tempCopyArgs -Wait -PassThru -NoNewWindow -RedirectStandardOutput "$env:TEMP\temp_copy.log" -RedirectStandardError "$env:TEMP\temp_copy_err.log"
+                        # Extract archive by mounting the same volume
+                        Write-Log "Extracting archive inside volume..." -Level debug
+                        $extractArgs = @('run', '--rm', '-v', "${volumeName}:/volume", 'busybox', 'sh', '-c', 'cd /volume && tar -xzf restore.tar.gz && rm restore.tar.gz')
+                        Write-Log "Docker extract command: docker $($extractArgs -join ' ')" -Level debug
+                        $extractProcess = Start-Process -FilePath 'docker' -ArgumentList $extractArgs -Wait -PassThru -NoNewWindow -RedirectStandardOutput "$env:TEMP\tar_extract.log" -RedirectStandardError "$env:TEMP\tar_extract_err.log"
                         
-                        $tempCopyError = Get-Content "$env:TEMP\temp_copy_err.log" -Raw -ErrorAction SilentlyContinue
-                        $tempCopyOutput = Get-Content "$env:TEMP\temp_copy.log" -Raw -ErrorAction SilentlyContinue
-                        
-                        Write-Log "Temp copy exit code: $($tempCopyProcess.ExitCode)" -Level debug
-                        if ($tempCopyOutput) { Write-Log "Temp copy output: $tempCopyOutput" -Level debug }
-                        if ($tempCopyError) { Write-Log "Temp copy stderr: $tempCopyError" -Level debug }
-                        
-                        if ($tempCopyProcess.ExitCode -eq 0) {
-                            # Now copy from temporary volume to extraction container
-                            Write-Log "Copying from temporary volume to extraction container..." -Level debug
-                            $finalCopyArgs = @('run', '--rm', '--volumes-from', $extractContainer, '-v', "${tempVolume}:/transfer", 'busybox', 'cp', '/transfer/archive.tar.gz', '/archive.tar.gz')
-                            Write-Log "Final copy command: docker $($finalCopyArgs -join ' ')" -Level debug
-                            $finalCopyProcess = Start-Process -FilePath 'docker' -ArgumentList $finalCopyArgs -Wait -PassThru -NoNewWindow -RedirectStandardOutput "$env:TEMP\final_copy.log" -RedirectStandardError "$env:TEMP\final_copy_err.log"
-                            
-                            $finalCopyError = Get-Content "$env:TEMP\final_copy_err.log" -Raw -ErrorAction SilentlyContinue
-                            $finalCopyOutput = Get-Content "$env:TEMP\final_copy.log" -Raw -ErrorAction SilentlyContinue
-                            
-                            Write-Log "Final copy exit code: $($finalCopyProcess.ExitCode)" -Level debug
-                            if ($finalCopyOutput) { Write-Log "Final copy output: $finalCopyOutput" -Level debug }
-                            if ($finalCopyError) { Write-Log "Final copy stderr: $finalCopyError" -Level debug }
-                            
-                            if ($finalCopyProcess.ExitCode -eq 0) {
-                                # Verify the file exists using volumes-from since container is stopped
-                                Write-Log "Verifying file was successfully transferred..." -Level debug
-                                $verifyArgs = @('run', '--rm', '--volumes-from', $extractContainer, 'busybox', 'ls', '-la', '/archive.tar.gz')
-                                $verifyProcess = Start-Process -FilePath 'docker' -ArgumentList $verifyArgs -Wait -PassThru -NoNewWindow -RedirectStandardOutput "$env:TEMP\verify.log" -RedirectStandardError "$env:TEMP\verify_err.log"
-                                
-                                if ($verifyProcess.ExitCode -eq 0) {
-                                    $verifyOutput = Get-Content "$env:TEMP\verify.log" -Raw -ErrorAction SilentlyContinue
-                                    if ($verifyOutput -and $verifyOutput.Contains('/archive.tar.gz')) {
-                                        Write-Log "File successfully transferred using volume-based method" -Level info
-                                        Write-Log "Archive in container: $verifyOutput" -Level debug
-                                        $copySuccess = $true
-                                    } else {
-                                        Write-Log "Volume-based transfer failed verification - file not found in container" -Level error
-                                    }
-                                } else {
-                                    $verifyError = Get-Content "$env:TEMP\verify_err.log" -Raw -ErrorAction SilentlyContinue
-                                    Write-Log "File verification failed: $verifyError" -Level error
-                                }
-                            } else {
-                                Write-Log "Final copy from temporary volume failed: $finalCopyError" -Level error
-                            }
-                        } else {
-                            Write-Log "Copy to temporary volume failed: $tempCopyError" -Level error
+                        if ($extractProcess.ExitCode -ne 0) {
+                            $extractError = Get-Content "$env:TEMP\tar_extract_err.log" -Raw -ErrorAction SilentlyContinue
+                            $extractOutput = Get-Content "$env:TEMP\tar_extract.log" -Raw -ErrorAction SilentlyContinue
+                            Write-Log "Archive extraction failed. Error: $extractError" -Level error
+                            Write-Log "Archive extraction output: $extractOutput" -Level debug
+                            throw "Failed to extract tar.gz archive: $extractError"
                         }
+                        
+                        $extractOutput = Get-Content "$env:TEMP\tar_extract.log" -Raw -ErrorAction SilentlyContinue
+                        if ($extractOutput) {
+                            Write-Log "Extraction output: $extractOutput" -Level debug
+                        }
+                        
+                        Write-Log "Archive extracted successfully to volume: $volumeName" -Level debug
                     }
                     finally {
-                        # Clean up temporary volume
-                        Write-Log "Cleaning up temporary volume: $tempVolume" -Level debug
-                        docker volume rm $tempVolume 2>&1 | Out-Null
+                        # Clean up temporary container
+                        Write-Log "Cleaning up temporary container..." -Level debug
+                        docker rm $tempContainer 2>&1 | Out-Null
+                    }
+                    
+                } else {
+                    # Handle .zip files - extract to temp directory first, then copy to volume
+                    Write-Log "Extracting zip archive to volume..." -Level debug
+                    
+                    $tempDir = Join-Path $env:TEMP "docker-restore-$(Get-Random)"
+                    New-Item -Path $tempDir -ItemType Directory -Force | Out-Null
+                    
+                    try {
+                        # Extract zip file
+                        Expand-Archive -Path $volumeFile.FullName -DestinationPath $tempDir -Force
                         
-                        # Clean up temporary file if it exists
-                        $tempFilePath = "$env:TEMP\docker-restore\archive.tar.gz"
-                        if (Test-Path $tempFilePath) {
-                            Write-Log "Cleaning up temporary file: $tempFilePath" -Level debug
-                            Remove-Item $tempFilePath -Force -ErrorAction SilentlyContinue
+                        # Copy contents to volume using container
+                        $copyArgs = @(
+                            'run', '--rm',
+                            '-v', "${volumeName}:/volume",
+                            '-v', "${tempDir}:/source:ro",
+                            'busybox', 'sh', '-c', 'cp -r /source/* /volume/ 2>/dev/null || cp -r /source/. /volume/'
+                        )
+                        
+                        $process = Start-Process -FilePath 'docker' -ArgumentList $copyArgs -Wait -PassThru -NoNewWindow
+                        if ($process.ExitCode -ne 0) {
+                            throw "Failed to copy extracted files to volume"
+                        }
+                        
+                        Write-Log "Archive extracted successfully to volume: $volumeName" -Level debug
+                    }
+                    finally {
+                        # Clean up temp directory
+                        if (Test-Path $tempDir) {
+                            Remove-Item $tempDir -Recurse -Force -ErrorAction SilentlyContinue
                         }
                     }
-                    
-                    if (-not $copySuccess) {
-                        Write-Log "Volume-based file transfer failed" -Level error
-                        docker rm $extractContainer 2>&1 | Out-Null
-                        throw "Failed to copy archive to container using volume-based transfer method"
-                    }
-
-                    
-                    # Test archive integrity first
-                    Write-Log "Testing archive integrity..." -Level debug
-                    $testArgs = @('run', '--rm', '--volumes-from', $extractContainer, 'busybox', 'tar', '-tzf', '/archive.tar.gz')
-                    $testProcess = Start-Process -FilePath 'docker' -ArgumentList $testArgs -Wait -PassThru -NoNewWindow -RedirectStandardOutput "$env:TEMP\tar_test.log" -RedirectStandardError "$env:TEMP\tar_test_err.log"
-                    if ($testProcess.ExitCode -ne 0) {
-                        $testError = Get-Content "$env:TEMP\tar_test_err.log" -Raw -ErrorAction SilentlyContinue
-                        Write-Log "Archive integrity test failed: $testError" -Level error
-                        docker rm $extractContainer 2>&1 | Out-Null
-                        throw "Archive integrity test failed: $testError"
-                    }
-                    $testOutput = Get-Content "$env:TEMP\tar_test.log" -Raw -ErrorAction SilentlyContinue
-                    Write-Log "Archive contents preview: $($testOutput.Split("`n")[0..4] -join ', ')..." -Level debug
-                    
-                    # Extract archive inside container with verbose output
-                    Write-Log "Extracting archive with verbose logging..." -Level debug
-                    $extractArgs = @('run', '--rm', '--volumes-from', $extractContainer, 'busybox', 'tar', '-xzvf', '/archive.tar.gz', '-C', '/')
-                    $extractProcess = Start-Process -FilePath 'docker' -ArgumentList $extractArgs -Wait -PassThru -NoNewWindow -RedirectStandardOutput "$env:TEMP\tar_extract.log" -RedirectStandardError "$env:TEMP\tar_extract_err.log"
-                    if ($extractProcess.ExitCode -ne 0) {
-                        $extractError = Get-Content "$env:TEMP\tar_extract_err.log" -Raw -ErrorAction SilentlyContinue
-                        $extractOutput = Get-Content "$env:TEMP\tar_extract.log" -Raw -ErrorAction SilentlyContinue
-                        Write-Log "Archive extraction failed. Error: $extractError" -Level error
-                        Write-Log "Archive extraction output: $extractOutput" -Level debug
-                        docker rm $extractContainer 2>&1 | Out-Null
-                        throw "Failed to extract tar.gz archive: $extractError"
-                    }
-                    $extractOutput = Get-Content "$env:TEMP\tar_extract.log" -Raw -ErrorAction SilentlyContinue
-                    Write-Log "Archive extracted successfully. Files: $($extractOutput.Split("`n").Count) entries" -Level debug
-                    
-                    # Copy extracted files to temp directory
-                    $copyOutArgs = @('cp', "${extractContainer}:/.", $tempDir)
-                    $process = Start-Process -FilePath 'docker' -ArgumentList $copyOutArgs -Wait -PassThru -NoNewWindow
-                    if ($process.ExitCode -ne 0) {
-                        Write-Log "Warning: Some files may not have been extracted" -Level warn
-                    }
-                    
-                    # Clean up extraction container
-                    docker rm $extractContainer 2>&1 | Out-Null
-                } else {
-                    # Handle .zip files
-                    Expand-Archive -Path $volumeFile.FullName -DestinationPath $tempDir -Force
                 }
                 
-                # Copy contents to volume using container
-                $copyArgs = @(
-                    'run', '--rm', '--name', $tempContainer,
-                    '-v', "${volumeName}:/volume",
-                    '-v', "${tempDir}:/source",
-                    'busybox', 'sh', '-c', 'cp -r /source/* /volume/ 2>/dev/null || true'
-                )
-                
-                $process = Start-Process -FilePath 'docker' -ArgumentList $copyArgs -Wait -PassThru -NoNewWindow
-                if ($process.ExitCode -ne 0) {
-                    Write-Log "Warning: Some files may not have been copied to volume $volumeName" -Level warn
-                }
-                
-                # Clean up temp directory
-                Remove-Item $tempDir -Recurse -Force
-                
-                Write-Log "Restored volume: $volumeName" -Level debug
+                Write-Log "Successfully restored volume: $volumeName" -Level info
             }
             catch {
                 Write-Log ("Failed to restore volume " + $volumeName + ": " + $_) -Level error
@@ -994,7 +901,8 @@ function Restore-Containers {
                             }
                             
                             $hostPort = Get-AvailablePort -PreferredPort ([int]$port.host_port)
-                            $portMapping = "${hostPort}:${port.container_port}"
+                            $containerPort = $port.container_port
+                            $portMapping = "${hostPort}:${containerPort}"
                             if ($port.host_ip -and $port.host_ip -ne '0.0.0.0') {
                                 $portMapping = "${port.host_ip}:$portMapping"
                             }
@@ -1026,7 +934,8 @@ function Restore-Containers {
                             }
                             
                             $volumeName = $volume.name + $NameSuffix
-                            $volumeMount = "${volumeName}:${volume.destination}"
+                            $volumeDestination = $volume.destination
+                            $volumeMount = "${volumeName}:${volumeDestination}"
                             if ($volume.read_only) {
                                 $volumeMount += ':ro'
                             }
@@ -1067,11 +976,6 @@ function Restore-Containers {
                     $runArgs += '--privileged'
                 }
                 
-                # Add entrypoint BEFORE image (Docker flag order matters!)
-                if ($container.entrypoint) {
-                    $runArgs += @('--entrypoint', ($container.entrypoint -join ' '))
-                }
-                
                 # Add image (check for snapshot first)
                 $imageToUse = $container.image
                 
@@ -1085,11 +989,35 @@ function Restore-Containers {
                     Write-Log "Using original image for container: $($container.name) -> $imageToUse" -Level debug
                 }
                 
+                # Handle entrypoint: --entrypoint only accepts ONE value (the executable)
+                # Any additional entrypoint args must be part of the command
+                $entrypointExec = $null
+                $entrypointArgs = @()
+                
+                if ($container.entrypoint -and $container.entrypoint.Count -gt 0) {
+                    $entrypointExec = $container.entrypoint[0]
+                    if ($container.entrypoint.Count -gt 1) {
+                        $entrypointArgs = $container.entrypoint[1..($container.entrypoint.Count - 1)]
+                    }
+                }
+                
+                # Add entrypoint if present (only the executable, not args)
+                if ($entrypointExec) {
+                    $runArgs += @('--entrypoint', $entrypointExec)
+                }
+                
                 $runArgs += $imageToUse
                 
-                # Add command AFTER image (these are container arguments)
+                # Add command AFTER image (combine entrypoint args + original command)
+                $fullCommand = @()
+                if ($entrypointArgs.Count -gt 0) {
+                    $fullCommand += $entrypointArgs
+                }
                 if ($container.command) {
-                    $runArgs += $container.command
+                    $fullCommand += $container.command
+                }
+                if ($fullCommand.Count -gt 0) {
+                    $runArgs += $fullCommand
                 }
                 
                 # Execute docker run
