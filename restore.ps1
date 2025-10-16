@@ -791,23 +791,92 @@ function Restore-BindMounts {
 function Get-AvailablePort {
     param([int]$PreferredPort)
     
+    # Check if preferred port is in use
+    $connection = Get-NetTCPConnection -LocalPort $PreferredPort -ErrorAction SilentlyContinue
+    $portInUse = $null -ne $connection
+    
     if ($PortStrategy -eq 'keep') {
+        if ($portInUse) {
+            Write-Log "Port $PreferredPort is already in use" -Level warn
+            
+            # In non-interactive mode, fail immediately
+            if ($NonInteractive) {
+                throw "Port $PreferredPort is already in use. Use -PortStrategy auto-remap to automatically find available ports, or -PortStrategy fail to abort on conflicts."
+            }
+            
+            # Interactive: prompt user for what to do
+            Write-Host ""
+            Write-Host "Port Conflict Detected" -ForegroundColor Yellow
+            Write-Host "Port $PreferredPort is already in use." -ForegroundColor Yellow
+            Write-Host ""
+            Write-Host "Options:" -ForegroundColor Cyan
+            Write-Host "  [A] Auto-remap to next available port (recommended)" -ForegroundColor White
+            Write-Host "  [C] Choose a different port manually" -ForegroundColor White
+            Write-Host "  [Q] Quit restore process" -ForegroundColor White
+            Write-Host ""
+            
+            do {
+                $choice = Read-Host "Your choice [A/C/Q]"
+                $choice = $choice.Trim().ToUpper()
+                
+                if ($choice -eq 'Q') {
+                    throw "Restore cancelled by user due to port conflict"
+                }
+                elseif ($choice -eq 'A') {
+                    # Find next available port
+                    for ($port = $PreferredPort + 1; $port -le 65535; $port++) {
+                        $testConnection = Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue
+                        if (-not $testConnection) {
+                            Write-Log "Auto-remapped port $PreferredPort to $port" -Level info
+                            Write-Host "Using port $port instead of $PreferredPort" -ForegroundColor Green
+                            return $port
+                        }
+                    }
+                    throw "No available ports found starting from $PreferredPort"
+                }
+                elseif ($choice -eq 'C') {
+                    # Let user choose custom port
+                    do {
+                        $customPortStr = Read-Host "Enter port number (1-65535)"
+                        if ($customPortStr -match '^\d+$') {
+                            $customPort = [int]$customPortStr
+                            if ($customPort -ge 1 -and $customPort -le 65535) {
+                                $testConnection = Get-NetTCPConnection -LocalPort $customPort -ErrorAction SilentlyContinue
+                                if (-not $testConnection) {
+                                    Write-Log "Using custom port $customPort instead of $PreferredPort" -Level info
+                                    Write-Host "Using port $customPort" -ForegroundColor Green
+                                    return $customPort
+                                }
+                                else {
+                                    Write-Host "Port $customPort is also in use. Try another port." -ForegroundColor Red
+                                }
+                            }
+                            else {
+                                Write-Host "Port must be between 1 and 65535" -ForegroundColor Red
+                            }
+                        }
+                        else {
+                            Write-Host "Invalid port number" -ForegroundColor Red
+                        }
+                    } while ($true)
+                }
+                else {
+                    Write-Host "Invalid choice. Please enter A, C, or Q." -ForegroundColor Red
+                }
+            } while ($true)
+        }
         return $PreferredPort
     }
     
     if ($PortStrategy -eq 'fail') {
-        # Check if port is in use
-        $connection = Get-NetTCPConnection -LocalPort $PreferredPort -ErrorAction SilentlyContinue
-        if ($connection) {
+        if ($portInUse) {
             throw "Port $PreferredPort is already in use"
         }
         return $PreferredPort
     }
     
     if ($PortStrategy -eq 'auto-remap') {
-        # Check if preferred port is available
-        $connection = Get-NetTCPConnection -LocalPort $PreferredPort -ErrorAction SilentlyContinue
-        if (-not $connection) {
+        if (-not $portInUse) {
             return $PreferredPort
         }
         
