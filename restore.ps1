@@ -701,13 +701,27 @@ function Restore-Volumes {
                                 } else {
                                     # Try to resolve using the container image
                                     try {
-                                        $idOutput = docker run --rm $image sh -c "id -u $user 2>/dev/null && id -g $user 2>/dev/null" 2>&1
-                                        if ($LASTEXITCODE -eq 0 -and $idOutput) {
-                                            $lines = $idOutput -split "`n" | Where-Object { $_ -match '^\d+$' }
+                                        # Run id commands to get UID and GID
+                                        $idCommand = "id -u $user && id -g $user"
+                                        $idArgs = @('run', '--rm', $image, 'sh', '-c', $idCommand)
+                                        $idProcess = Start-Process -FilePath 'docker' -ArgumentList $idArgs -Wait -PassThru -NoNewWindow -RedirectStandardOutput "$env:TEMP\id_out.log" -RedirectStandardError "$env:TEMP\id_err.log"
+                                        
+                                        if ($idProcess.ExitCode -eq 0) {
+                                            $idOutput = Get-Content "$env:TEMP\id_out.log" -Raw -ErrorAction SilentlyContinue
+                                            Write-Log "ID command output: $idOutput" -Level debug
+                                            
+                                            $lines = $idOutput -split "`n" | Where-Object { $_.Trim() -match '^\d+$' }
                                             if ($lines.Count -ge 2) {
-                                                $numericUser = "$($lines[0].Trim()):$($lines[1].Trim())"
+                                                $uid = $lines[0].Trim()
+                                                $gid = $lines[1].Trim()
+                                                $numericUser = "${uid}:${gid}"
                                                 Write-Log "Resolved '$user' to $numericUser" -Level debug
+                                            } else {
+                                                Write-Log "Could not parse UID:GID from output (found $($lines.Count) numeric lines)" -Level debug
                                             }
+                                        } else {
+                                            $idError = Get-Content "$env:TEMP\id_err.log" -Raw -ErrorAction SilentlyContinue
+                                            Write-Log "ID command failed (exit code $($idProcess.ExitCode)): $idError" -Level debug
                                         }
                                     } catch {
                                         Write-Log "Could not resolve user '$user' to numeric ID: $_" -Level debug
