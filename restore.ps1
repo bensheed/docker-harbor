@@ -667,8 +667,13 @@ function Restore-Volumes {
                         }
                         
                         # Copy file to temporary volume using a helper container
+                        # Mount parent directory to avoid Windows file mounting issues
+                        $sourceDir = Split-Path $sourcePath -Parent
+                        $sourceFileName = Split-Path $sourcePath -Leaf
                         Write-Log "Copying archive to temporary volume..." -Level debug
-                        $tempCopyArgs = @('run', '--rm', '-v', "${tempVolume}:/transfer", '-v', "`"${sourcePath}`":/source/archive.tar.gz:ro", 'busybox', 'cp', '/source/archive.tar.gz', '/transfer/archive.tar.gz')
+                        Write-Log "Source directory: $sourceDir" -Level debug
+                        Write-Log "Source filename: $sourceFileName" -Level debug
+                        $tempCopyArgs = @('run', '--rm', '-v', "${tempVolume}:/transfer", '-v', "`"${sourceDir}`":/source:ro", 'busybox', 'cp', "/source/${sourceFileName}", '/transfer/archive.tar.gz')
                         Write-Log "Temp copy command: docker $($tempCopyArgs -join ' ')" -Level debug
                         $tempCopyProcess = Start-Process -FilePath 'docker' -ArgumentList $tempCopyArgs -Wait -PassThru -NoNewWindow -RedirectStandardOutput "$env:TEMP\temp_copy.log" -RedirectStandardError "$env:TEMP\temp_copy_err.log"
                         
