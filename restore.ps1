@@ -658,21 +658,37 @@ function Restore-Volumes {
                         
                         # Extract archive by mounting the same volume
                         Write-Log "Extracting archive inside volume..." -Level debug
-                        $extractArgs = @('run', '--rm', '-v', "${volumeName}:/volume", 'busybox', 'sh', '-c', 'cd /volume && tar -xzf restore.tar.gz && rm restore.tar.gz')
-                        Write-Log "Docker extract command: docker $($extractArgs -join ' ')" -Level debug
-                        $extractProcess = Start-Process -FilePath 'docker' -ArgumentList $extractArgs -Wait -PassThru -NoNewWindow -RedirectStandardOutput "$env:TEMP\tar_extract.log" -RedirectStandardError "$env:TEMP\tar_extract_err.log"
                         
-                        if ($extractProcess.ExitCode -ne 0) {
-                            $extractError = Get-Content "$env:TEMP\tar_extract_err.log" -Raw -ErrorAction SilentlyContinue
-                            $extractOutput = Get-Content "$env:TEMP\tar_extract.log" -Raw -ErrorAction SilentlyContinue
-                            Write-Log "Archive extraction failed. Error: $extractError" -Level error
-                            Write-Log "Archive extraction output: $extractOutput" -Level debug
-                            throw "Failed to extract tar.gz archive: $extractError"
+                        # Use & operator to invoke docker directly (better for complex shell commands)
+                        $shellCmd = "cd /volume && tar -xzf restore.tar.gz && rm restore.tar.gz"
+                        Write-Log "Docker extract command: docker run --rm -v ${volumeName}:/volume busybox sh -c '$shellCmd'" -Level debug
+                        
+                        # Redirect output to capture
+                        $extractOutput = & docker run --rm -v "${volumeName}:/volume" busybox sh -c $shellCmd 2>&1
+                        $extractExitCode = $LASTEXITCODE
+                        
+                        if ($extractExitCode -ne 0) {
+                            Write-Log "Archive extraction failed with exit code $extractExitCode. Output: $extractOutput" -Level error
+                            throw "Failed to extract tar.gz archive: $extractOutput"
                         }
                         
-                        $extractOutput = Get-Content "$env:TEMP\tar_extract.log" -Raw -ErrorAction SilentlyContinue
                         if ($extractOutput) {
                             Write-Log "Extraction output: $extractOutput" -Level debug
+                        }
+                        
+                        # Verify extraction worked by checking if restore.tar.gz was removed
+                        Write-Log "Verifying extraction completed..." -Level debug
+                        $verifyArgs = @('run', '--rm', '-v', "${volumeName}:/volume", 'busybox', 'ls', '-la', '/volume')
+                        $verifyProcess = Start-Process -FilePath 'docker' -ArgumentList $verifyArgs -Wait -PassThru -NoNewWindow -RedirectStandardOutput "$env:TEMP\verify_extract.log" -RedirectStandardError "$env:TEMP\verify_extract_err.log"
+                        $verifyOutput = Get-Content "$env:TEMP\verify_extract.log" -Raw -ErrorAction SilentlyContinue
+                        
+                        if ($verifyOutput -match 'restore\.tar\.gz') {
+                            Write-Log "WARNING: restore.tar.gz still exists in volume! Extraction may have failed." -Level error
+                            Write-Log "Volume contents after extraction attempt: $verifyOutput" -Level debug
+                            throw "Archive extraction verification failed - restore.tar.gz was not removed"
+                        } else {
+                            Write-Log "Extraction verified - restore.tar.gz successfully removed" -Level debug
+                            Write-Log "Volume contents: $verifyOutput" -Level debug
                         }
                         
                         # Fix ownership if we know which container uses this volume
@@ -697,24 +713,22 @@ function Restore-Volumes {
                             # If we have numeric UID/GID, use busybox directly (always works)
                             if ($numericUser) {
                                 Write-Log "Setting ownership for volume $volumeName to UID:GID $numericUser using busybox" -Level debug
-                                $chownArgs = @('run', '--rm', '-v', "${volumeName}:/volume", 'busybox', 'chown', '-R', $numericUser, '/volume')
-                                $chownProcess = Start-Process -FilePath 'docker' -ArgumentList $chownArgs -Wait -PassThru -NoNewWindow -RedirectStandardError "$env:TEMP\chown_err.log"
+                                $chownOutput = & docker run --rm -v "${volumeName}:/volume" busybox chown -R $numericUser /volume 2>&1
+                                $chownExitCode = $LASTEXITCODE
                                 
-                                if ($chownProcess.ExitCode -eq 0) {
+                                if ($chownExitCode -eq 0) {
                                     Write-Log "Successfully set ownership to $numericUser" -Level info
                                 } else {
-                                    $chownError = Get-Content "$env:TEMP\chown_err.log" -Raw -ErrorAction SilentlyContinue
-                                    Write-Log "Failed to set ownership: $chownError" -Level warn
+                                    Write-Log "Failed to set ownership: $chownOutput" -Level warn
                                 }
                             } else {
                                 # Fallback: Try using the container image's chown (if it has one)
                                 Write-Log "No numeric UID/GID available, trying image's chown for user '$user'" -Level debug
-                                $chownArgs = @('run', '--rm', '-v', "${volumeName}:/volume", $image, 'chown', '-R', $user, '/volume')
-                                $chownProcess = Start-Process -FilePath 'docker' -ArgumentList $chownArgs -Wait -PassThru -NoNewWindow -RedirectStandardError "$env:TEMP\chown_err.log"
+                                $chownOutput = & docker run --rm -v "${volumeName}:/volume" $image chown -R $user /volume 2>&1
+                                $chownExitCode = $LASTEXITCODE
                                 
-                                if ($chownProcess.ExitCode -ne 0) {
-                                    $chownError = Get-Content "$env:TEMP\chown_err.log" -Raw -ErrorAction SilentlyContinue
-                                    Write-Log "Failed to set ownership using image's chown: $chownError" -Level debug
+                                if ($chownExitCode -ne 0) {
+                                    Write-Log "Failed to set ownership using image's chown: $chownOutput" -Level debug
                                     Write-Log "Skipping ownership fix - container may have permission issues on startup" -Level warn
                                     Write-Log "Note: Run backup with container running to capture numeric UID/GID for reliable restoration" -Level warn
                                 } else {
@@ -1385,7 +1399,9 @@ function Main {
                     
                     $volumeOwners[$volume.name] = $ownerData
                     if ($ownerData.uid) {
-                        Write-Log "Volume $($volume.name) will be owned by UID:GID ${ownerData.uid}:${ownerData.gid}" -Level debug
+                        $uid = $ownerData.uid
+                        $gid = $ownerData.gid
+                        Write-Log "Volume $($volume.name) will be owned by UID:GID ${uid}:${gid}" -Level debug
                     } else {
                         Write-Log "Volume $($volume.name) will be owned by user '$($ownerData.user)' (UID not captured during backup)" -Level debug
                     }
