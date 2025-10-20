@@ -581,7 +581,10 @@ function Restore-Networks {
 }
 
 function Restore-Volumes {
-    param([string]$BackupPath)
+    param(
+        [string]$BackupPath,
+        [hashtable]$VolumeOwnerInfo = @{}
+    )
     
     Write-Log "Restoring Docker volumes..." -Level info
     
@@ -655,21 +658,83 @@ function Restore-Volumes {
                         
                         # Extract archive by mounting the same volume
                         Write-Log "Extracting archive inside volume..." -Level debug
-                        $extractArgs = @('run', '--rm', '-v', "${volumeName}:/volume", 'busybox', 'sh', '-c', 'cd /volume && tar -xzf restore.tar.gz && rm restore.tar.gz')
-                        Write-Log "Docker extract command: docker $($extractArgs -join ' ')" -Level debug
-                        $extractProcess = Start-Process -FilePath 'docker' -ArgumentList $extractArgs -Wait -PassThru -NoNewWindow -RedirectStandardOutput "$env:TEMP\tar_extract.log" -RedirectStandardError "$env:TEMP\tar_extract_err.log"
                         
-                        if ($extractProcess.ExitCode -ne 0) {
-                            $extractError = Get-Content "$env:TEMP\tar_extract_err.log" -Raw -ErrorAction SilentlyContinue
-                            $extractOutput = Get-Content "$env:TEMP\tar_extract.log" -Raw -ErrorAction SilentlyContinue
-                            Write-Log "Archive extraction failed. Error: $extractError" -Level error
-                            Write-Log "Archive extraction output: $extractOutput" -Level debug
-                            throw "Failed to extract tar.gz archive: $extractError"
+                        # Use & operator to invoke docker directly (better for complex shell commands)
+                        $shellCmd = "cd /volume && tar -xzf restore.tar.gz && rm restore.tar.gz"
+                        Write-Log "Docker extract command: docker run --rm -v ${volumeName}:/volume busybox sh -c '$shellCmd'" -Level debug
+                        
+                        # Redirect output to capture
+                        $extractOutput = & docker run --rm -v "${volumeName}:/volume" busybox sh -c $shellCmd 2>&1
+                        $extractExitCode = $LASTEXITCODE
+                        
+                        if ($extractExitCode -ne 0) {
+                            Write-Log "Archive extraction failed with exit code $extractExitCode. Output: $extractOutput" -Level error
+                            throw "Failed to extract tar.gz archive: $extractOutput"
                         }
                         
-                        $extractOutput = Get-Content "$env:TEMP\tar_extract.log" -Raw -ErrorAction SilentlyContinue
                         if ($extractOutput) {
                             Write-Log "Extraction output: $extractOutput" -Level debug
+                        }
+                        
+                        # Verify extraction worked by checking if restore.tar.gz was removed
+                        Write-Log "Verifying extraction completed..." -Level debug
+                        $verifyArgs = @('run', '--rm', '-v', "${volumeName}:/volume", 'busybox', 'ls', '-la', '/volume')
+                        $verifyProcess = Start-Process -FilePath 'docker' -ArgumentList $verifyArgs -Wait -PassThru -NoNewWindow -RedirectStandardOutput "$env:TEMP\verify_extract.log" -RedirectStandardError "$env:TEMP\verify_extract_err.log"
+                        $verifyOutput = Get-Content "$env:TEMP\verify_extract.log" -Raw -ErrorAction SilentlyContinue
+                        
+                        if ($verifyOutput -match 'restore\.tar\.gz') {
+                            Write-Log "WARNING: restore.tar.gz still exists in volume! Extraction may have failed." -Level error
+                            Write-Log "Volume contents after extraction attempt: $verifyOutput" -Level debug
+                            throw "Archive extraction verification failed - restore.tar.gz was not removed"
+                        } else {
+                            Write-Log "Extraction verified - restore.tar.gz successfully removed" -Level debug
+                            Write-Log "Volume contents: $verifyOutput" -Level debug
+                        }
+                        
+                        # Fix ownership if we know which container uses this volume
+                        if ($VolumeOwnerInfo.ContainsKey($volumeName)) {
+                            $ownerData = $VolumeOwnerInfo[$volumeName]
+                            $user = $ownerData.user
+                            $image = $ownerData.image
+                            $uid = $ownerData.uid
+                            $gid = $ownerData.gid
+                            
+                            # Strategy: Use numeric UID/GID if available (captured during backup)
+                            $numericUser = $null
+                            if ($uid -and $gid -and $uid -ne $null -and $gid -ne $null) {
+                                $numericUser = "${uid}:${gid}"
+                                Write-Log "Using UID/GID from backup manifest: $numericUser" -Level info
+                            } elseif ($user -match '^\d+:\d+$') {
+                                # Username is already numeric
+                                $numericUser = $user
+                                Write-Log "Username is already numeric: $numericUser" -Level debug
+                            }
+                            
+                            # If we have numeric UID/GID, use busybox directly (always works)
+                            if ($numericUser) {
+                                Write-Log "Setting ownership for volume $volumeName to UID:GID $numericUser using busybox" -Level debug
+                                $chownOutput = & docker run --rm -v "${volumeName}:/volume" busybox chown -R $numericUser /volume 2>&1
+                                $chownExitCode = $LASTEXITCODE
+                                
+                                if ($chownExitCode -eq 0) {
+                                    Write-Log "Successfully set ownership to $numericUser" -Level info
+                                } else {
+                                    Write-Log "Failed to set ownership: $chownOutput" -Level warn
+                                }
+                            } else {
+                                # Fallback: Try using the container image's chown (if it has one)
+                                Write-Log "No numeric UID/GID available, trying image's chown for user '$user'" -Level debug
+                                $chownOutput = & docker run --rm -v "${volumeName}:/volume" $image chown -R $user /volume 2>&1
+                                $chownExitCode = $LASTEXITCODE
+                                
+                                if ($chownExitCode -ne 0) {
+                                    Write-Log "Failed to set ownership using image's chown: $chownOutput" -Level debug
+                                    Write-Log "Skipping ownership fix - container may have permission issues on startup" -Level warn
+                                    Write-Log "Note: Run backup with container running to capture numeric UID/GID for reliable restoration" -Level warn
+                                } else {
+                                    Write-Log "Ownership set successfully" -Level info
+                                }
+                            }
                         }
                         
                         Write-Log "Archive extracted successfully to volume: $volumeName" -Level debug
@@ -791,23 +856,92 @@ function Restore-BindMounts {
 function Get-AvailablePort {
     param([int]$PreferredPort)
     
+    # Check if preferred port is in use
+    $connection = Get-NetTCPConnection -LocalPort $PreferredPort -ErrorAction SilentlyContinue
+    $portInUse = $null -ne $connection
+    
     if ($PortStrategy -eq 'keep') {
+        if ($portInUse) {
+            Write-Log "Port $PreferredPort is already in use" -Level warn
+            
+            # In non-interactive mode, fail immediately
+            if ($NonInteractive) {
+                throw "Port $PreferredPort is already in use. Use -PortStrategy auto-remap to automatically find available ports, or -PortStrategy fail to abort on conflicts."
+            }
+            
+            # Interactive: prompt user for what to do
+            Write-Host ""
+            Write-Host "Port Conflict Detected" -ForegroundColor Yellow
+            Write-Host "Port $PreferredPort is already in use." -ForegroundColor Yellow
+            Write-Host ""
+            Write-Host "Options:" -ForegroundColor Cyan
+            Write-Host "  [A] Auto-remap to next available port (recommended)" -ForegroundColor White
+            Write-Host "  [C] Choose a different port manually" -ForegroundColor White
+            Write-Host "  [Q] Quit restore process" -ForegroundColor White
+            Write-Host ""
+            
+            do {
+                $choice = Read-Host "Your choice [A/C/Q]"
+                $choice = $choice.Trim().ToUpper()
+                
+                if ($choice -eq 'Q') {
+                    throw "Restore cancelled by user due to port conflict"
+                }
+                elseif ($choice -eq 'A') {
+                    # Find next available port
+                    for ($port = $PreferredPort + 1; $port -le 65535; $port++) {
+                        $testConnection = Get-NetTCPConnection -LocalPort $port -ErrorAction SilentlyContinue
+                        if (-not $testConnection) {
+                            Write-Log "Auto-remapped port $PreferredPort to $port" -Level info
+                            Write-Host "Using port $port instead of $PreferredPort" -ForegroundColor Green
+                            return $port
+                        }
+                    }
+                    throw "No available ports found starting from $PreferredPort"
+                }
+                elseif ($choice -eq 'C') {
+                    # Let user choose custom port
+                    do {
+                        $customPortStr = Read-Host "Enter port number (1-65535)"
+                        if ($customPortStr -match '^\d+$') {
+                            $customPort = [int]$customPortStr
+                            if ($customPort -ge 1 -and $customPort -le 65535) {
+                                $testConnection = Get-NetTCPConnection -LocalPort $customPort -ErrorAction SilentlyContinue
+                                if (-not $testConnection) {
+                                    Write-Log "Using custom port $customPort instead of $PreferredPort" -Level info
+                                    Write-Host "Using port $customPort" -ForegroundColor Green
+                                    return $customPort
+                                }
+                                else {
+                                    Write-Host "Port $customPort is also in use. Try another port." -ForegroundColor Red
+                                }
+                            }
+                            else {
+                                Write-Host "Port must be between 1 and 65535" -ForegroundColor Red
+                            }
+                        }
+                        else {
+                            Write-Host "Invalid port number" -ForegroundColor Red
+                        }
+                    } while ($true)
+                }
+                else {
+                    Write-Host "Invalid choice. Please enter A, C, or Q." -ForegroundColor Red
+                }
+            } while ($true)
+        }
         return $PreferredPort
     }
     
     if ($PortStrategy -eq 'fail') {
-        # Check if port is in use
-        $connection = Get-NetTCPConnection -LocalPort $PreferredPort -ErrorAction SilentlyContinue
-        if ($connection) {
+        if ($portInUse) {
             throw "Port $PreferredPort is already in use"
         }
         return $PreferredPort
     }
     
     if ($PortStrategy -eq 'auto-remap') {
-        # Check if preferred port is available
-        $connection = Get-NetTCPConnection -LocalPort $PreferredPort -ErrorAction SilentlyContinue
-        if (-not $connection) {
+        if (-not $portInUse) {
             return $PreferredPort
         }
         
@@ -913,8 +1047,11 @@ function Restore-Containers {
                             }
                         }
                         catch {
-                            Write-Log ("Failed to map port " + $port.host_port + ": " + $_) -Level error
-                            if ($PortStrategy -eq 'fail') {
+                            $errorMsg = $_
+                            Write-Log ("Failed to map port " + $port.host_port + ": " + $errorMsg) -Level error
+                            
+                            # Re-throw if user cancelled or if PortStrategy is 'fail'
+                            if ($errorMsg -match "cancelled by user" -or $PortStrategy -eq 'fail') {
                                 throw
                             }
                         }
@@ -989,6 +1126,18 @@ function Restore-Containers {
                     Write-Log "Using original image for container: $($container.name) -> $imageToUse" -Level debug
                 }
                 
+                # Verify image exists
+                $imageExists = docker images --format "{{.Repository}}:{{.Tag}}" | Select-String -Pattern "^$([regex]::Escape($imageToUse))$" -Quiet
+                if (-not $imageExists) {
+                    # Try without tag
+                    $imageBase = $imageToUse -replace ':.*$', ''
+                    $imageExists = docker images --format "{{.Repository}}" | Select-String -Pattern "^$([regex]::Escape($imageBase))$" -Quiet
+                    if (-not $imageExists) {
+                        throw "Image not found: $imageToUse. Make sure images were loaded successfully."
+                    }
+                }
+                Write-Log "Verified image exists: $imageToUse" -Level debug
+                
                 # Handle entrypoint: --entrypoint only accepts ONE value (the executable)
                 # Any additional entrypoint args must be part of the command
                 $entrypointExec = $null
@@ -1022,9 +1171,26 @@ function Restore-Containers {
                 
                 # Execute docker run
                 Write-Log "Running: docker $($runArgs -join ' ')" -Level debug
-                $process = Start-Process -FilePath 'docker' -ArgumentList $runArgs -Wait -PassThru -NoNewWindow
-                if ($process.ExitCode -ne 0) {
-                    throw "Container creation failed with exit code $($process.ExitCode)"
+                
+                # Use native PowerShell invocation instead of Start-Process to properly handle arguments with spaces
+                # Redirect stderr to capture Docker errors
+                $output = & docker $runArgs 2>&1
+                $exitCode = $LASTEXITCODE
+                
+                if ($exitCode -ne 0) {
+                    # Separate stdout and stderr from combined output
+                    $stderr = ($output | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] } | ForEach-Object { $_.Exception.Message }) -join "`n"
+                    $stdout = ($output | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] } | Out-String).Trim()
+                    
+                    $errorMsg = "Container creation failed with exit code $exitCode"
+                    if ($stderr) {
+                        $errorMsg += "`nDocker error: $stderr"
+                        Write-Log "Docker stderr: $stderr" -Level debug
+                    }
+                    if ($stdout) {
+                        Write-Log "Docker stdout: $stdout" -Level debug
+                    }
+                    throw $errorMsg
                 }
                 
                 $script:RestoredContainers += $containerName
@@ -1205,8 +1371,47 @@ function Main {
         $success = $false
     }
     
+    # Build volume ownership map from container configs
+    # This fixes a common issue: when restoring volumes, extracted files are owned by root,
+    # but containers often run as non-root users (node, postgres, redis, etc.)
+    # Without this, containers get permission denied errors when accessing their own data.
+    # 
+    # We now capture numeric UID/GID during backup for accurate restoration.
+    # If multiple containers share a volume with different users, the last one wins.
+    $volumeOwners = @{}
+    foreach ($container in $script:Manifest.containers) {
+        if ($container.user -and $container.volumes -and $container.image) {
+            foreach ($volume in $container.volumes) {
+                if ($volume.type -eq 'volume' -and $volume.name) {
+                    $ownerData = @{
+                        user = $container.user
+                        uid = $container.uid
+                        gid = $container.gid
+                        image = $container.image
+                    }
+                    
+                    if ($volumeOwners.ContainsKey($volume.name)) {
+                        $existing = $volumeOwners[$volume.name]
+                        if ($existing.user -ne $ownerData.user) {
+                            Write-Log "Warning: Volume $($volume.name) is used by multiple containers with different users. Using $($ownerData.user)" -Level warn
+                        }
+                    }
+                    
+                    $volumeOwners[$volume.name] = $ownerData
+                    if ($ownerData.uid) {
+                        $uid = $ownerData.uid
+                        $gid = $ownerData.gid
+                        Write-Log "Volume $($volume.name) will be owned by UID:GID ${uid}:${gid}" -Level debug
+                    } else {
+                        Write-Log "Volume $($volume.name) will be owned by user '$($ownerData.user)' (UID not captured during backup)" -Level debug
+                    }
+                }
+            }
+        }
+    }
+    
     # Restore volumes
-    if (-not (Restore-Volumes $BackupRoot)) {
+    if (-not (Restore-Volumes $BackupRoot $volumeOwners)) {
         $success = $false
     }
     

@@ -754,6 +754,79 @@ function Export-ContainerConfig {
     $containerName = $ContainerDetails.Name -replace '^/', ''
     Write-Log "Exporting configuration for container: $containerName" -Level debug
     
+    # Capture numeric UID/GID for ownership restoration
+    $numericUid = $null
+    $numericGid = $null
+    $userName = $ContainerDetails.Config.User
+    
+    if ($userName) {
+        Write-Log "Attempting to capture numeric UID/GID for user: $userName" -Level debug
+        
+        # Strategy 1: If container is running, exec into it
+        if ($ContainerDetails.State.Running) {
+            Write-Log "Container is running, trying docker exec..." -Level debug
+            try {
+                $uidResult = docker exec $containerName sh -c "id -u" 2>&1
+                $gidResult = docker exec $containerName sh -c "id -g" 2>&1
+                if ($LASTEXITCODE -eq 0) {
+                    $numericUid = $uidResult.Trim()
+                    $numericGid = $gidResult.Trim()
+                    Write-Log "Captured UID/GID via docker exec: ${numericUid}:${numericGid}" -Level info
+                } else {
+                    Write-Log "Docker exec failed (container may not have shell): $uidResult" -Level debug
+                }
+            } catch {
+                Write-Log "Docker exec error: $_" -Level debug
+            }
+        }
+        
+        # Strategy 2: Check file ownership in volumes (if container has volumes with files)
+        if (-not $numericUid -and $ContainerDetails.Mounts) {
+            Write-Log "Trying to detect UID from volume file ownership..." -Level debug
+            foreach ($mount in $ContainerDetails.Mounts) {
+                if ($mount.Type -eq 'volume' -and $mount.Name) {
+                    try {
+                        $statResult = docker run --rm -v "$($mount.Name):/v:ro" busybox stat -c '%u:%g' /v 2>&1
+                        if ($LASTEXITCODE -eq 0 -and $statResult -match '^\d+:\d+$') {
+                            $numericUid, $numericGid = $statResult.Trim() -split ':'
+                            Write-Log "Captured UID/GID from volume '$($mount.Name)' ownership: ${numericUid}:${numericGid}" -Level info
+                            break
+                        }
+                    } catch {
+                        Write-Log "Failed to stat volume $($mount.Name): $_" -Level debug
+                    }
+                }
+            }
+        }
+        
+        # Strategy 3: Try running a temp container from the image (if it has shell)
+        if (-not $numericUid) {
+            Write-Log "Trying to run temp container from image to resolve username..." -Level debug
+            try {
+                $imageName = $ContainerDetails.Config.Image
+                $idResult = docker run --rm $imageName sh -c "id -u $userName && id -g $userName" 2>&1
+                if ($LASTEXITCODE -eq 0) {
+                    $uidLines = $idResult -split "`n"
+                    if ($uidLines.Count -ge 2) {
+                        $numericUid = $uidLines[0].Trim()
+                        $numericGid = $uidLines[1].Trim()
+                        Write-Log "Captured UID/GID via temp container: ${numericUid}:${numericGid}" -Level info
+                    }
+                } else {
+                    Write-Log "Temp container id command failed (image may not have shell): $idResult" -Level debug
+                }
+            } catch {
+                Write-Log "Temp container error: $_" -Level debug
+            }
+        }
+        
+        if ($numericUid) {
+            Write-Log "Successfully captured numeric UID/GID: ${numericUid}:${numericGid}" -Level info
+        } else {
+            Write-Log "Could not capture numeric UID/GID - will be resolved during restore" -Level warn
+        }
+    }
+    
     # Create normalized run specification
     $runSpec = @{
         name = $containerName
@@ -764,6 +837,8 @@ function Export-ContainerConfig {
         labels = $ContainerDetails.Config.Labels
         working_dir = $ContainerDetails.Config.WorkingDir
         user = $ContainerDetails.Config.User
+        uid = $numericUid
+        gid = $numericGid
         ports = @()
         volumes = @()
         networks = @()
