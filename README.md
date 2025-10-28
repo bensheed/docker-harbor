@@ -1,5 +1,7 @@
 # Docker Harbor
 
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/bensheed/docker-harbor)
+
 **Complete Docker Container Backup & Restore Solution**
 
 A PowerShell-based tool for comprehensive Docker environment backup and restoration, designed for both development and production use cases.
